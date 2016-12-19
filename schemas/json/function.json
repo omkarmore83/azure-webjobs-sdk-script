@@ -64,8 +64,22 @@
                             },
                             {
                                 "$ref": "#/definitions/dynamic"
+                            },
+                            {
+                                "$ref": "#/definitions/notificationHub"
+                            },
+                            {
+                                "$ref": "#/definitions/twilioSms"
+                            },
+                            {
+                                "$ref": "#/definitions/sendGrid"
+                            },
+                            {
+                                "$ref": "#/definitions/mobileTable"
+                            },
+                            {
+                                "$ref": "#/definitions/documentDB"
                             }
-                            
                         ]
                     }
                 }
@@ -83,7 +97,12 @@
                 "manualTrigger",
                 "blobTrigger",
                 "serviceBusTrigger",
-                "table"
+                "table",
+                "notificationHub",
+                "twilioSms",
+                "sendGrid",
+                "mobileTable",
+                "documentDB"
             ]
         },
         "serviceBusTrigger": {
@@ -227,11 +246,125 @@
                         "admin"
                     ],
                     "description": "The function HTTP authorization level."
+                },
+                "methods": {
+                    "type": "array",
+                    "items": [
+                        {
+                            "type": "string",
+                            "enum": [
+                                "get",
+                                "post",
+                                "delete",
+                                "head",
+                                "patch",
+                                "put",
+                                "options",
+                                "trace"
+                            ]
+                        }
+                    ]
                 }
             },
             "allOf": [
                 {
                     "$ref": "#/definitions/trigger"
+                }
+            ]
+        },
+        "mobileTable": {
+            "properties": {
+                "type": {
+                    "type": "string",
+                    "pattern": "mobileTable"
+                },
+                "tableName": {
+                    "type": "string",
+                    "description": "This is the name of the table within your Mobile App to which data will be written."
+                },
+                "connection": {
+                    "type": "string",
+                    "description": "This is the app setting name that specifies the URL of your Mobile App."
+                },
+                "apiKey": {
+                    "type": "string",
+                    "description": "This is app setting name that specifies the API Key for your Mobile App."
+                }
+            },
+            "oneOf": [
+                {
+                    "$ref": "#/definitions/mobileTableInputBinding"
+                },
+                {
+                    "$ref": "#/definitions/mobileTableOutputBinding"
+                }
+            ]
+        },
+        "mobileTableInputBinding": {
+            "properties": {
+                "id": {
+                    "type": "string",
+                    "description": "This is the id for the record to retrieve."
+                }
+            },
+            "allOf": [
+                {
+                    "$ref": "#/definitions/inputBinding"
+                }
+            ]
+        },
+        "mobileTableOutputBinding": {
+            "allOf": [
+                {
+                    "$ref": "#/definitions/outputBinding"
+                }
+            ]
+        },
+        "documentDB": {
+            "properties": {
+                "type": {
+                    "type": "string",
+                    "pattern": "documentDB"
+                },
+                "connection": {
+                    "type": "string",
+                    "description": "This is the connection string for your DocumentDB account."
+                },
+                "databaseName": {
+                    "type": "string",
+                    "description": "This is the name of the database within your DocumentDB account to which data will be written."
+                },
+                "collectionName": {
+                    "type": "string",
+                    "description": "This is the name of the collection within your database to which data will be written."
+                }
+            },
+            "oneOf": [
+                {
+                    "$ref": "#/definitions/documentDBInputBinding"
+                },
+                {
+                    "$ref": "#/definitions/documentDBOutputBinding"
+                }
+            ]
+        },
+        "documentDBInputBinding": {
+            "allOf": [
+                {
+                    "$ref": "#/definitions/inputBinding"
+                }
+            ]
+        },
+        "documentDBOutputBinding": {
+            "properties": {
+                "createIfNotExists": {
+                    "type": "boolean",
+                    "description": "When true, your database and collection will be created automatically."
+                }
+            },
+            "allOf": [
+                {
+                    "$ref": "#/definitions/outputBinding"
                 }
             ]
         },
@@ -263,7 +396,7 @@
                     "$ref": "#/definitions/tableInputBinding"
                 },
                 {
-                     "$ref": "#/definitions/tableOutputBinding"
+                    "$ref": "#/definitions/tableOutputBinding"
                 }
             ]
         },
@@ -284,7 +417,110 @@
                 }
             ]
         },
-         "tableOutputBinding": {
+        "tableOutputBinding": {
+            "allOf": [
+                {
+                    "$ref": "#/definitions/outputBinding"
+                }
+            ]
+        },
+        "notificationHub": {
+            "properties": {
+                "type": {
+                    "type": "string",
+                    "pattern": "notificationHub"
+                },
+                "tagExpression": {
+                    "type": "string",
+                    "description": "The tag to send the notification to."
+                },
+                "hubName": {
+                    "type": "string",
+                    "description": "The name of the notification hub."
+                },
+                "connection": {
+                    "type": "string",
+                    "description": "The name of the app setting which contains the notification hub connection string."
+                },
+                "platform": {
+                    "type": "string",
+                    "description": "The notification platform to target.",
+                    "enum": [
+                        "template",
+                        "apns",
+                        "adm",
+                        "gcm",
+                        "wns",
+                        "mpns"
+                    ]
+                }
+            },
+            "allOf": [
+                {
+                    "$ref": "#/definitions/outputBinding"
+                }
+            ]
+        },
+        "twilioSms": {
+            "properties": {
+                "type": {
+                    "type": "string",
+                    "pattern": "twilioSms"
+                },
+                "accountSid": {
+                    "type": "string",
+                    "description": "The name of the app setting which contains your Twilio Account Sid."
+                },
+                "authToken": {
+                    "type": "string",
+                    "description": "The name of the app setting which contains your Twilio authentication token."
+                },
+                "to": {
+                    "type": "string",
+                    "description": "The phone number the SMS text is sent to."
+                },
+                "from": {
+                    "type": "string",
+                    "description": "The phone number the SMS text is sent from."
+                },
+                "body": {
+                    "type": "string",
+                    "description": "Optional body of SMS text message."
+                }
+            },
+            "allOf": [
+                {
+                    "$ref": "#/definitions/outputBinding"
+                }
+            ]
+        },
+        "sendGrid": {
+            "properties": {
+                "type": {
+                    "type": "string",
+                    "pattern": "sendGrid"
+                },
+                "apiKey": {
+                    "type": "string",
+                    "description": "The name of the app setting which contains your SendGrid api key."
+                },
+                "to": {
+                    "type": "string",
+                    "description": "The email address to send to."
+                },
+                "from": {
+                    "type": "string",
+                    "description": "The email address to send from."
+                },
+                "subject": {
+                    "type": "string",
+                    "description": "The subject of the email."
+                },
+                "text": {
+                    "type": "string",
+                    "description": "The text of the email."
+                }
+            },
             "allOf": [
                 {
                     "$ref": "#/definitions/outputBinding"
