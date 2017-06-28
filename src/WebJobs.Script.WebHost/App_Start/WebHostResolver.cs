@@ -8,6 +8,8 @@ using System.Linq;
 using System.Reflection;
 using System.Threading.Tasks;
 using Microsoft.Azure.WebJobs.Script.Config;
+using Microsoft.Azure.WebJobs.Script.Diagnostics;
+using Microsoft.Azure.WebJobs.Script.Eventing;
 using Microsoft.Azure.WebJobs.Script.WebHost.WebHooks;
 
 namespace Microsoft.Azure.WebJobs.Script.WebHost
@@ -17,6 +19,7 @@ namespace Microsoft.Azure.WebJobs.Script.WebHost
         private static object _syncLock = new object();
 
         private readonly ISecretManagerFactory _secretManagerFactory;
+        private readonly IScriptEventManager _eventManager;
         private ScriptHostConfiguration _standbyScriptHostConfig;
         private WebScriptHostManager _standbyHostManager;
         private WebHookReceiverManager _standbyReceiverManager;
@@ -27,10 +30,16 @@ namespace Microsoft.Azure.WebJobs.Script.WebHost
 
         private static ScriptSettingsManager _settingsManager;
 
-        public WebHostResolver(ScriptSettingsManager settingsManager, ISecretManagerFactory secretManagerFactory)
+        public WebHostResolver(ScriptSettingsManager settingsManager, ISecretManagerFactory secretManagerFactory, IScriptEventManager eventManager)
         {
             _settingsManager = settingsManager;
             _secretManagerFactory = secretManagerFactory;
+            _eventManager = eventManager;
+        }
+
+        public ISwaggerDocumentManager GetSwaggerDocumentManager(WebHostSettings settings)
+        {
+            return GetWebScriptHostManager(settings).SwaggerDocumentManager;
         }
 
         public ScriptHostConfiguration GetScriptHostConfiguration(WebHostSettings settings)
@@ -51,6 +60,11 @@ namespace Microsoft.Azure.WebJobs.Script.WebHost
         public ISecretManager GetSecretManager(WebHostSettings settings)
         {
             return GetWebScriptHostManager(settings).SecretManager;
+        }
+
+        public HostPerformanceManager GetPerformanceManager(WebHostSettings settings)
+        {
+            return GetWebScriptHostManager(settings).PerformanceManager;
         }
 
         public WebScriptHostManager GetWebScriptHostManager(WebHostSettings settings)
@@ -98,9 +112,9 @@ namespace Microsoft.Azure.WebJobs.Script.WebHost
                         ReinitializeAppSettings();
                     }
 
-                    _activeScriptHostConfig = GetScriptHostConfiguration(settings.ScriptPath, settings.LogPath);
+                    _activeScriptHostConfig = CreateScriptHostConfiguration(settings);
 
-                    _activeHostManager = new WebScriptHostManager(_activeScriptHostConfig, _secretManagerFactory, _settingsManager, settings);
+                    _activeHostManager = new WebScriptHostManager(_activeScriptHostConfig, _secretManagerFactory, _eventManager,  _settingsManager, settings);
                     _activeReceiverManager = new WebHookReceiverManager(_activeHostManager.SecretManager);
 
                     _standbyHostManager?.Dispose();
@@ -116,9 +130,9 @@ namespace Microsoft.Azure.WebJobs.Script.WebHost
             {
                 if (_standbyHostManager == null)
                 {
-                    _standbyScriptHostConfig = GetScriptHostConfiguration(settings.ScriptPath, settings.LogPath);
+                    _standbyScriptHostConfig = CreateScriptHostConfiguration(settings);
 
-                    _standbyHostManager = new WebScriptHostManager(_standbyScriptHostConfig, _secretManagerFactory, _settingsManager, settings);
+                    _standbyHostManager = new WebScriptHostManager(_standbyScriptHostConfig, _secretManagerFactory, _eventManager, _settingsManager, settings);
                     _standbyReceiverManager = new WebHookReceiverManager(_standbyHostManager.SecretManager);
                 }
             }
@@ -137,33 +151,20 @@ namespace Microsoft.Azure.WebJobs.Script.WebHost
             }
         }
 
-        private static ScriptHostConfiguration GetScriptHostConfiguration(string scriptPath, string logPath)
+        internal static ScriptHostConfiguration CreateScriptHostConfiguration(WebHostSettings settings)
         {
-            InitializeFileSystem(scriptPath);
+            InitializeFileSystem(settings.ScriptPath);
 
             var scriptHostConfig = new ScriptHostConfiguration()
             {
-                RootScriptPath = scriptPath,
-                RootLogPath = logPath,
-                FileLoggingMode = FileLoggingMode.DebugOnly
+                RootScriptPath = settings.ScriptPath,
+                RootLogPath = settings.LogPath,
+                FileLoggingMode = FileLoggingMode.DebugOnly,
+                TraceWriter = settings.TraceWriter,
+                IsSelfHost = settings.IsSelfHost
             };
 
-            // If running on Azure Web App, derive the host ID from the default subdomain
-            string hostId = _settingsManager.AzureWebsiteDefaultSubdomain;
-            if (!String.IsNullOrEmpty(hostId))
-            {
-                // Truncate to the max host name length if needed
-                const int MaximumHostIdLength = 32;
-                if (hostId.Length > MaximumHostIdLength)
-                {
-                    hostId = hostId.Substring(0, MaximumHostIdLength);
-                }
-
-                // Trim any trailing - as they can cause problems with queue names
-                hostId = hostId.TrimEnd('-');
-
-                scriptHostConfig.HostConfig.HostId = hostId.ToLowerInvariant();
-            }
+            scriptHostConfig.HostConfig.HostId = Utility.GetDefaultHostId(_settingsManager, scriptHostConfig);
 
             return scriptHostConfig;
         }
@@ -193,7 +194,7 @@ namespace Microsoft.Azure.WebJobs.Script.WebHost
                         folders.Add(Path.Combine(home, @"site\tools"));
 
                         string path = Environment.GetEnvironmentVariable("PATH");
-                        string additionalPaths = String.Join(";", folders);
+                        string additionalPaths = string.Join(";", folders);
 
                         // Make sure we haven't already added them. This can happen if the appdomain restart (since it's still same process)
                         if (!path.Contains(additionalPaths))

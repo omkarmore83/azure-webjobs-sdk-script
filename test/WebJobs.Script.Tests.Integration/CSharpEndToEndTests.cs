@@ -9,7 +9,6 @@ using System.Net;
 using System.Net.Http;
 using System.Net.Http.Headers;
 using System.Threading.Tasks;
-using System.Web.Http;
 using Microsoft.CodeAnalysis;
 using Microsoft.CodeAnalysis.CSharp;
 using Microsoft.WindowsAzure.Storage.Blob;
@@ -94,6 +93,12 @@ namespace Microsoft.Azure.WebJobs.Script.Tests
         }
 
         [Fact]
+        public async Task FileLogging_Succeeds()
+        {
+            await FileLogging_SucceedsTest();
+        }
+
+        [Fact]
         public async Task MultipleOutputs()
         {
             string id1 = Guid.NewGuid().ToString();
@@ -141,6 +146,25 @@ namespace Microsoft.Azure.WebJobs.Script.Tests
             await Fixture.Host.CallAsync("LoadScriptReference", arguments);
 
             Assert.Equal("TestClass", request.Properties["LoadedScriptResponse"]);
+        }
+
+        [Fact]
+        public async Task ExecutionContext_IsPopulated()
+        {
+            var request = new HttpRequestMessage(HttpMethod.Get, "http://functions/myfunc");
+            Dictionary<string, object> arguments = new Dictionary<string, object>()
+            {
+                { "req", request }
+            };
+
+            string functionName = "FunctionExecutionContext";
+            await Fixture.Host.CallAsync(functionName, arguments);
+
+            ExecutionContext context = request.Properties["ContextValue"] as ExecutionContext;
+
+            Assert.NotNull(context);
+            Assert.Equal(functionName, context.FunctionName);
+            Assert.Equal(Path.Combine(Fixture.Host.ScriptConfig.RootScriptPath, functionName), context.FunctionDirectory);
         }
 
         [Fact]
@@ -301,6 +325,55 @@ namespace Microsoft.Azure.WebJobs.Script.Tests
             Assert.Equal("Name: Mathew Charles, Location: Seattle", body);
         }
 
+        [Fact]
+        public async Task HttpTriggerToBlob()
+        {
+            var request = new HttpRequestMessage
+            {
+                RequestUri = new Uri($"http://localhost/api/HttpTriggerToBlob?Suffix=TestSuffix"),
+                Method = HttpMethod.Post,
+            };
+            request.SetConfiguration(Fixture.RequestConfiguration);
+            request.Headers.Add("Prefix", "TestPrefix");
+            request.Headers.Add("Value", "TestValue");
+
+            var id = Guid.NewGuid().ToString();
+            var metadata = new JObject()
+            {
+                { "M1", "AAA" },
+                { "M2", "BBB" }
+            };
+            var input = new JObject()
+            {
+                { "Id", id },
+                { "Value", "TestInput" },
+                { "Metadata", metadata }
+            };
+            request.Content = new StringContent(input.ToString());
+            request.Content.Headers.ContentType = new MediaTypeHeaderValue("application/json");
+            request.Headers.Accept.Add(new MediaTypeWithQualityHeaderValue("text/plain"));
+
+            var arguments = new Dictionary<string, object>
+            {
+                { "input", request },
+                { ScriptConstants.SystemTriggerParameterName, request }
+            };
+            await Fixture.Host.CallAsync("HttpTriggerToBlob", arguments);
+
+            HttpResponseMessage response = (HttpResponseMessage)request.Properties[ScriptConstants.AzureFunctionsHttpResponseKey];
+            Assert.Equal(HttpStatusCode.OK, response.StatusCode);
+
+            string body = await response.Content.ReadAsStringAsync();
+            string expectedValue = $"TestInput{id}TestValue";
+            Assert.Equal(expectedValue, body);
+
+            // verify blob was written
+            string blobName = $"TestPrefix-{id}-TestSuffix-BBB";
+            var outBlob = Fixture.TestOutputContainer.GetBlockBlobReference(blobName);
+            string result = await TestHelpers.WaitForBlobAndGetStringAsync(outBlob);
+            Assert.Equal(expectedValue, Utility.RemoveUtf8ByteOrderMark(result));
+        }
+
         [Theory]
         [InlineData("application/json", "\"Name: Fabio Cavalcante, Location: Seattle\"")]
         [InlineData("application/xml", "<string xmlns=\"http://schemas.microsoft.com/2003/10/Serialization/\">Name: Fabio Cavalcante, Location: Seattle</string>")]
@@ -408,13 +481,7 @@ namespace SecondaryDependency
         public class TestInput
         {
             public int Id { get; set; }
-            public string Value { get; set; }
-        }
 
-        public class ScenarioInput
-        {
-            public string Scenario { get; set; }
-            public string Container { get; set; }
             public string Value { get; set; }
         }
     }

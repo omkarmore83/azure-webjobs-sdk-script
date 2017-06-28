@@ -15,7 +15,10 @@ using System.Threading;
 using System.Threading.Tasks;
 using Microsoft.Azure.WebJobs.Script.Config;
 using Microsoft.Azure.WebJobs.Script.Description;
+using Microsoft.Azure.WebJobs.Script.Eventing;
 using Microsoft.Azure.WebJobs.Script.WebHost;
+using Microsoft.WebJobs.Script.Tests;
+using Moq;
 using Xunit;
 
 namespace Microsoft.Azure.WebJobs.Script.Tests
@@ -43,7 +46,7 @@ namespace Microsoft.Azure.WebJobs.Script.Tests
             // create the FunctionDefinition
             FunctionMetadata metadata = new FunctionMetadata();
             TestInvoker invoker = new TestInvoker();
-            FunctionDescriptor function = new FunctionDescriptor("TimerFunction", invoker, metadata, parameters);
+            FunctionDescriptor function = new FunctionDescriptor("TimerFunction", invoker, metadata, parameters, null, null, null);
             Collection<FunctionDescriptor> functions = new Collection<FunctionDescriptor>();
             functions.Add(function);
 
@@ -104,10 +107,13 @@ namespace Microsoft.Azure.WebJobs.Script.Tests
             };
 
             string secretsPath = Path.Combine(Path.GetTempPath(), @"FunctionTests\Secrets");
+            ISecretsRepository repository = new FileSystemSecretsRepository(secretsPath);
             WebHostSettings webHostSettings = new WebHostSettings();
-            var secretManager = new SecretManager(SettingsManager, secretsPath, NullTraceWriter.Instance);
+            webHostSettings.SecretsPath = secretsPath;
+            var eventManagerMock = new Mock<IScriptEventManager>();
+            var secretManager = new SecretManager(SettingsManager, repository, NullTraceWriter.Instance, null);
 
-            using (var manager = new WebScriptHostManager(config, new TestSecretManagerFactory(secretManager), SettingsManager, webHostSettings))
+            using (var manager = new WebScriptHostManager(config, new TestSecretManagerFactory(secretManager), eventManagerMock.Object, SettingsManager, webHostSettings))
             {
                 Thread runLoopThread = new Thread(_ =>
                 {
@@ -121,7 +127,7 @@ namespace Microsoft.Azure.WebJobs.Script.Tests
                     return manager.State == ScriptHostState.Running;
                 });
 
-                var request = new HttpRequestMessage(HttpMethod.Get, String.Format("http://localhost/api/httptrigger-{0}", fixture));
+                var request = new HttpRequestMessage(HttpMethod.Get, string.Format("http://localhost/api/httptrigger-{0}", fixture));
                 FunctionDescriptor function = manager.GetHttpFunctionOrNull(request);
 
                 SynchronizationContext currentContext = SynchronizationContext.Current;
@@ -131,7 +137,7 @@ namespace Microsoft.Azure.WebJobs.Script.Tests
                 {
                     var requestThread = new Thread(() =>
                     {
-                        var context = new SingleThreadSynchronizationContext();
+                        var context = new SingleThreadedSynchronizationContext();
                         SynchronizationContext.SetSynchronizationContext(context);
 
                         manager.HandleRequestAsync(function, request, CancellationToken.None)
@@ -154,31 +160,6 @@ namespace Microsoft.Azure.WebJobs.Script.Tests
                 {
                     SynchronizationContext.SetSynchronizationContext(currentContext);
                     manager.Stop();
-                }
-            }
-        }
-
-        private sealed class SingleThreadSynchronizationContext : SynchronizationContext
-        {
-            private readonly ConcurrentQueue<Tuple<SendOrPostCallback, object>> _workItems =
-                new ConcurrentQueue<Tuple<SendOrPostCallback, object>>();
-
-            public override void Post(SendOrPostCallback d, object state)
-            {
-                _workItems.Enqueue(new Tuple<SendOrPostCallback, object>(d, state));
-            }
-
-            public override void Send(SendOrPostCallback d, object state)
-            {
-                throw new NotSupportedException();
-            }
-
-            public void Run()
-            {
-                Tuple<SendOrPostCallback, object> item;
-                while (_workItems.TryDequeue(out item))
-                {
-                    item.Item1(item.Item2);
                 }
             }
         }

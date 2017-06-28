@@ -7,11 +7,12 @@ using Microsoft.Azure.WebJobs.Host;
 
 namespace Microsoft.Azure.WebJobs.Script
 {
-    public sealed class ConditionalTraceWriter : TraceWriter
+    public sealed class ConditionalTraceWriter : TraceWriter, IDisposable
     {
         private readonly Func<TraceEvent, bool> _predicate;
+        private bool _disposed = false;
 
-        public ConditionalTraceWriter(TraceWriter innerWriter, Func<TraceEvent, bool> predicate) 
+        public ConditionalTraceWriter(TraceWriter innerWriter, Func<TraceEvent, bool> predicate)
             : base(innerWriter?.Level ?? TraceLevel.Off)
         {
             if (innerWriter == null)
@@ -47,6 +48,15 @@ namespace Microsoft.Azure.WebJobs.Script
         {
             InnerWriter.Flush();
             base.Flush();
+        }
+
+        public void Dispose()
+        {
+            if (!_disposed)
+            {
+                (InnerWriter as IDisposable)?.Dispose();
+                _disposed = true;
+            }
         }
     }
 }

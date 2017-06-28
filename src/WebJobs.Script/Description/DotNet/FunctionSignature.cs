@@ -4,6 +4,7 @@
 using System;
 using System.Collections.Immutable;
 using System.Linq;
+using System.Reflection;
 using Microsoft.CodeAnalysis;
 
 namespace Microsoft.Azure.WebJobs.Script.Description
@@ -11,7 +12,6 @@ namespace Microsoft.Azure.WebJobs.Script.Description
     /// <summary>
     /// Provides function identity validation and identification.
     /// </summary>
-    [CLSCompliant(false)]
     public sealed class FunctionSignature : IEquatable<FunctionSignature>
     {
         private readonly ImmutableArray<FunctionParameter> _parameters;
@@ -30,8 +30,7 @@ namespace Microsoft.Azure.WebJobs.Script.Description
         }
 
         /// <summary>
-        /// Returns true if the function uses locally defined types (i.e. types defined in the function assembly) in its parameters;
-        /// otherwise, false.
+        /// Gets a value indicating whether the function uses locally defined types (i.e. types defined in the function assembly) in its parameters.
         /// </summary>
         public bool HasLocalTypeReference => _hasLocalTypeReference;
 
@@ -42,6 +41,18 @@ namespace Microsoft.Azure.WebJobs.Script.Description
         public string MethodName => _methodName;
 
         public string ReturnTypeName => _returnTypeName;
+
+        public MethodInfo GetMethod(Assembly assembly)
+        {
+            if (assembly == null)
+            {
+                throw new ArgumentNullException(nameof(assembly));
+            }
+
+            return assembly.DefinedTypes
+                .FirstOrDefault(t => string.Compare(t.FullName, ParentTypeName, StringComparison.Ordinal) == 0)
+                ?.GetMethod(MethodName);
+        }
 
         public bool Equals(FunctionSignature other)
         {

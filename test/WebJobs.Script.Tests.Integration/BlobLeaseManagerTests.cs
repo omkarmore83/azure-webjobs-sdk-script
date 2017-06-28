@@ -27,7 +27,7 @@ namespace Microsoft.Azure.WebJobs.Script.Tests
             string instanceId = Guid.NewGuid().ToString();
             var traceWriter = new TestTraceWriter(System.Diagnostics.TraceLevel.Verbose);
 
-            using (var manager = await BlobLeaseManager.CreateAsync(connectionString, TimeSpan.FromSeconds(15), hostId, instanceId, traceWriter))
+            using (var manager = await BlobLeaseManager.CreateAsync(connectionString, TimeSpan.FromSeconds(15), hostId, instanceId, traceWriter, null))
             {
                 await TestHelpers.Await(() => manager.HasLease);
 
@@ -55,7 +55,7 @@ namespace Microsoft.Azure.WebJobs.Script.Tests
 
             try
             {
-                manager = await BlobLeaseManager.CreateAsync(connectionString, TimeSpan.FromSeconds(15), hostId, instanceId, traceWriter);
+                manager = await BlobLeaseManager.CreateAsync(connectionString, TimeSpan.FromSeconds(15), hostId, instanceId, traceWriter, null);
                 manager.HasLeaseChanged += (s, a) => resetEvent.Set();
             }
             finally
@@ -89,7 +89,7 @@ namespace Microsoft.Azure.WebJobs.Script.Tests
             BlobLeaseManager manager = null;
             string tempLeaseId = null;
 
-            using (manager = new BlobLeaseManager(blob, TimeSpan.FromSeconds(15), hostId, instanceId, traceWriter, TimeSpan.FromSeconds(3)))
+            using (manager = new BlobLeaseManager(blob, TimeSpan.FromSeconds(15), hostId, instanceId, traceWriter, null, TimeSpan.FromSeconds(3)))
             {
                 try
                 {
@@ -139,7 +139,7 @@ namespace Microsoft.Azure.WebJobs.Script.Tests
                 .Callback(() => renewResetEvent.Set());
 
             BlobLeaseManager manager;
-            using (manager = new BlobLeaseManager(blobMock.Object, TimeSpan.FromSeconds(5), hostId, instanceId, traceWriter))
+            using (manager = new BlobLeaseManager(blobMock.Object, TimeSpan.FromSeconds(5), hostId, instanceId, traceWriter, null))
             {
                 renewResetEvent.Wait(TimeSpan.FromSeconds(10));
             }
@@ -173,7 +173,7 @@ namespace Microsoft.Azure.WebJobs.Script.Tests
             // Delete the blob
             await blob.DeleteIfExistsAsync();
 
-            using (var manager = new BlobLeaseManager(blobMock.Object, TimeSpan.FromSeconds(15), hostId, instanceId, traceWriter, TimeSpan.FromSeconds(3)))
+            using (var manager = new BlobLeaseManager(blobMock.Object, TimeSpan.FromSeconds(15), hostId, instanceId, traceWriter, null, TimeSpan.FromSeconds(3)))
             {
                 renewResetEvent.Wait(TimeSpan.FromSeconds(10));
 
@@ -197,7 +197,7 @@ namespace Microsoft.Azure.WebJobs.Script.Tests
 
             var traceWriter = new TestTraceWriter(System.Diagnostics.TraceLevel.Verbose);
 
-            using (var manager = await BlobLeaseManager.CreateAsync(connectionString, TimeSpan.FromSeconds(15), hostId, instanceId, traceWriter))
+            using (var manager = await BlobLeaseManager.CreateAsync(connectionString, TimeSpan.FromSeconds(15), hostId, instanceId, traceWriter, null))
             {
                 await TestHelpers.Await(() => manager.HasLease);
             }
@@ -231,9 +231,9 @@ namespace Microsoft.Azure.WebJobs.Script.Tests
 
             var blobMock = new Mock<ICloudBlob>();
             blobMock.Setup(b => b.AcquireLeaseAsync(It.IsAny<TimeSpan>(), It.IsAny<string>()))
-                .Returns(() => Task.FromResult(hostId));            
+                .Returns(() => Task.FromResult(hostId));
 
-            using (var manager = new BlobLeaseManager(blobMock.Object, TimeSpan.FromSeconds(5), hostId, instanceId, traceWriter))
+            using (var manager = new BlobLeaseManager(blobMock.Object, TimeSpan.FromSeconds(5), hostId, instanceId, traceWriter, null))
             {
                 renewResetEvent.Wait(TimeSpan.FromSeconds(10));
 
@@ -244,7 +244,7 @@ namespace Microsoft.Azure.WebJobs.Script.Tests
             TraceEvent acquisitionEvent = traceWriter.Traces.First();
             Assert.Contains($"Host lock lease acquired by instance ID '{instanceId}'.", acquisitionEvent.Message);
             Assert.Equal(TraceLevel.Info, acquisitionEvent.Level);
-        }      
+        }
 
         [Fact]
         public async Task TraceOutputsMessagesWhenLeaseRenewalFails()
@@ -262,10 +262,9 @@ namespace Microsoft.Azure.WebJobs.Script.Tests
                 .Returns(() => Task.FromException(new StorageException(new RequestResult { HttpStatusCode = 409 }, "test", null)))
                 .Callback(() => renewResetEvent.Set());
 
-            using (var manager = new BlobLeaseManager(blobMock.Object, TimeSpan.FromSeconds(5), hostId, instanceId, traceWriter))
+            using (var manager = new BlobLeaseManager(blobMock.Object, TimeSpan.FromSeconds(5), hostId, instanceId, traceWriter, null))
             {
                 renewResetEvent.Wait(TimeSpan.FromSeconds(10));
-                // Make sure we have enough time to trace the renewal
                 await TestHelpers.Await(() => traceWriter.Traces.Count == 2, 5000, 500);
             }
 
@@ -273,9 +272,9 @@ namespace Microsoft.Azure.WebJobs.Script.Tests
             Assert.Contains($"Host lock lease acquired by instance ID '{instanceId}'.", acquisitionEvent.Message);
             Assert.Equal(TraceLevel.Info, acquisitionEvent.Level);
 
-            TraceEvent renewalEvent = traceWriter.Traces.Skip(1).First();            
+            TraceEvent renewalEvent = traceWriter.Traces.Skip(1).First();
             string pattern = @"Failed to renew host lock lease: Another host has acquired the lease. The last successful renewal completed at (.+) \([0-9]+ milliseconds ago\) with a duration of [0-9]+ milliseconds.";
-            Assert.True(Regex.IsMatch(renewalEvent.Message, pattern), $"Expected trace event {pattern} not found.");            
+            Assert.True(Regex.IsMatch(renewalEvent.Message, pattern), $"Expected trace event {pattern} not found.");
             Assert.Equal(TraceLevel.Info, renewalEvent.Level);
         }
 
@@ -288,8 +287,8 @@ namespace Microsoft.Azure.WebJobs.Script.Tests
             string connectionString = AmbientConnectionStringProvider.Instance.GetConnectionString(ConnectionStringNames.Storage);
             var traceWriter = new TestTraceWriter(TraceLevel.Verbose);
 
-            using (var manager1 = await BlobLeaseManager.CreateAsync(connectionString, TimeSpan.FromSeconds(15), hostId1, instanceId, traceWriter))
-            using (var manager2 = await BlobLeaseManager.CreateAsync(connectionString, TimeSpan.FromSeconds(15), hostId2, instanceId, traceWriter))
+            using (var manager1 = await BlobLeaseManager.CreateAsync(connectionString, TimeSpan.FromSeconds(15), hostId1, instanceId, traceWriter, null))
+            using (var manager2 = await BlobLeaseManager.CreateAsync(connectionString, TimeSpan.FromSeconds(15), hostId2, instanceId, traceWriter, null))
             {
                 Task manager1Check = TestHelpers.Await(() => manager1.HasLease);
                 Task manager2Check = TestHelpers.Await(() => manager2.HasLease);

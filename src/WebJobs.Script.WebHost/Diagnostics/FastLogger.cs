@@ -4,10 +4,10 @@
 using System;
 using System.Threading;
 using System.Threading.Tasks;
+using Microsoft.Azure.WebJobs.Host;
 using Microsoft.Azure.WebJobs.Host.Loggers;
 using Microsoft.Azure.WebJobs.Logging;
 using Microsoft.WindowsAzure.Storage;
-using Newtonsoft.Json;
 
 namespace Microsoft.Azure.WebJobs.Script.WebHost.Diagnostics
 {
@@ -16,29 +16,46 @@ namespace Microsoft.Azure.WebJobs.Script.WebHost.Diagnostics
     {
         private readonly ILogWriter _writer;
 
-        public FastLogger(string hostName, string accountConnectionString)
+        public FastLogger(string hostName, string accountConnectionString, TraceWriter trace)
         {
+            if (trace == null)
+            {
+                throw new ArgumentNullException(nameof(trace));
+            }
+
             CloudStorageAccount account = CloudStorageAccount.Parse(accountConnectionString);
             var client = account.CreateCloudTableClient();
             var tableProvider = LogFactory.NewLogTableProvider(client);
-                        
+
             string containerName = Environment.MachineName;
-            this._writer = LogFactory.NewWriter(hostName, containerName, tableProvider);
+            this._writer = LogFactory.NewWriter(hostName, containerName, tableProvider, (e) => OnException(e, trace));
         }
 
         public async Task AddAsync(FunctionInstanceLogEntry item, CancellationToken cancellationToken = default(CancellationToken))
         {
-            // Convert Host to Protocol so we can log it 
-            var settings = new JsonSerializerSettings { NullValueHandling = NullValueHandling.Ignore };
-            var jsonClone = JsonConvert.SerializeObject(item, settings);
-            var item2 = JsonConvert.DeserializeObject<FunctionInstanceLogItem>(jsonClone);
-            item2.FunctionName = Utility.GetFunctionShortName(item2.FunctionName);
-            await _writer.AddAsync(item2);
+            await _writer.AddAsync(new FunctionInstanceLogItem
+            {
+                FunctionInstanceId = item.FunctionInstanceId,
+                FunctionName = Utility.GetFunctionShortName(item.FunctionName),
+                StartTime = item.StartTime,
+                EndTime = item.EndTime,
+                TriggerReason = item.TriggerReason,
+                Arguments = item.Arguments,
+                ErrorDetails = item.ErrorDetails,
+                LogOutput = item.LogOutput,
+                ParentId = item.ParentId
+            });
         }
 
         public Task FlushAsync(CancellationToken cancellationToken = default(CancellationToken))
         {
             return _writer.FlushAsync();
+        }
+
+        public static void OnException(Exception exception, TraceWriter trace)
+        {
+            string errorString = $"Error writing logs to table storage: {exception.ToString()}";
+            trace.Error(errorString, exception);
         }
     }
 }

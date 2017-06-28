@@ -11,7 +11,8 @@ namespace Microsoft.Azure.WebJobs.Script.Config
         private static ScriptSettingsManager _instance = new ScriptSettingsManager();
         private readonly ConcurrentDictionary<string, string> _settingsCache = new ConcurrentDictionary<string, string>();
 
-        internal ScriptSettingsManager()
+        // for testing
+        public ScriptSettingsManager()
         {
         }
 
@@ -21,11 +22,13 @@ namespace Microsoft.Azure.WebJobs.Script.Config
             set { _instance = value; }
         }
 
-        public bool IsAzureEnvironment => !string.IsNullOrEmpty(GetSetting(EnvironmentSettingNames.AzureWebsiteInstanceId));
+        public virtual bool IsAzureEnvironment => !string.IsNullOrEmpty(GetSetting(EnvironmentSettingNames.AzureWebsiteInstanceId));
 
         public bool IsRemoteDebuggingEnabled => !string.IsNullOrEmpty(GetSetting(EnvironmentSettingNames.RemoteDebuggingPort));
 
-        public string AzureWebsiteDefaultSubdomain
+        public bool IsDynamicSku => GetSetting(EnvironmentSettingNames.AzureWebsiteSku) == ScriptConstants.DynamicSku;
+
+        public virtual string AzureWebsiteDefaultSubdomain
         {
             get
             {
@@ -43,6 +46,52 @@ namespace Microsoft.Azure.WebJobs.Script.Config
                     return null;
                 });
             }
+        }
+
+        /// <summary>
+        /// Gets a value that uniquely identifies the site and slot.
+        /// </summary>
+        public virtual string AzureWebsiteUniqueSlotName
+        {
+            get
+            {
+                string name = GetSetting(EnvironmentSettingNames.AzureWebsiteName);
+                string slotName = GetSetting(EnvironmentSettingNames.AzureWebsiteSlotName);
+
+                if (!string.IsNullOrEmpty(slotName) &&
+                    !string.Equals(slotName, ScriptConstants.DefaultProductionSlotName, StringComparison.OrdinalIgnoreCase))
+                {
+                    name += $"-{slotName}";
+                }
+
+                return name?.ToLowerInvariant();
+            }
+        }
+
+        public virtual string ApplicationInsightsInstrumentationKey
+        {
+            get => GetSettingFromCache(EnvironmentSettingNames.AppInsightsInstrumentationKey);
+            set => UpdateSettingInCache(EnvironmentSettingNames.AppInsightsInstrumentationKey, value);
+        }
+
+        private string GetSettingFromCache(string settingKey)
+        {
+            if (string.IsNullOrEmpty(settingKey))
+            {
+                throw new ArgumentNullException(nameof(settingKey));
+            }
+
+            return _settingsCache.GetOrAdd(settingKey, (key) => Utility.GetSettingFromConfigOrEnvironment(key));
+        }
+
+        private void UpdateSettingInCache(string settingKey, string settingValue)
+        {
+            if (string.IsNullOrEmpty(settingKey))
+            {
+                throw new ArgumentNullException(nameof(settingKey));
+            }
+
+            _settingsCache.AddOrUpdate(settingKey, settingValue, (a, b) => settingValue);
         }
 
         public virtual void Reset()

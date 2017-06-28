@@ -2,18 +2,22 @@
 // Licensed under the MIT License. See License.txt in the project root for license information.
 
 using System;
+using System.Collections.Generic;
 using System.IO;
 using System.Linq;
 using System.Runtime.ExceptionServices;
 using System.Threading;
 using System.Threading.Tasks;
 using Microsoft.Azure.WebJobs.Script.Config;
+using Microsoft.Azure.WebJobs.Script.Description;
 using Microsoft.Azure.WebJobs.Script.Diagnostics;
+using Microsoft.Azure.WebJobs.Script.Eventing;
 using Microsoft.WindowsAzure.Storage.Blob;
 using Moq;
 using Moq.Protected;
 using Newtonsoft.Json.Linq;
 using Xunit;
+using static Microsoft.Azure.WebJobs.Script.FunctionTraceWriterFactory;
 
 namespace Microsoft.Azure.WebJobs.Script.Tests
 {
@@ -25,8 +29,9 @@ namespace Microsoft.Azure.WebJobs.Script.Tests
         {
             _settingsManager = ScriptSettingsManager.Instance;
         }
-        // Update a script file (the function.json) to force the ScriptHost to re-index and pick up new changes. 
-        // Test with timers: 
+
+        // Update a script file (the function.json) to force the ScriptHost to re-index and pick up new changes.
+        // Test with timers:
         [Fact]
         public async Task UpdateFileAndRestart()
         {
@@ -38,41 +43,151 @@ namespace Microsoft.Azure.WebJobs.Script.Tests
             var config = fixture.Host.ScriptConfig;
 
             ExceptionDispatchInfo exception = null;
-
-            using (var manager = new ScriptHostManager(config))
+            using (var eventManager = new ScriptEventManager())
+            using (var manager = new ScriptHostManager(config, eventManager))
             {
-                // Background task to run while the main thread is pumping events at RunAndBlock(). 
+                // Background task to run while the main thread is pumping events at RunAndBlock().
                 Thread t = new Thread(_ =>
-                   {
-                       // don't start until the manager is running
-                       TestHelpers.Await(() => manager.State == ScriptHostState.Running).Wait();
+                {
+                    // don't start until the manager is running
+                    TestHelpers.Await(() => manager.State == ScriptHostState.Running).Wait();
 
-                       try
-                       {
-                           // Wait for initial execution.
-                           TestHelpers.Await(() =>
-                           {
-                               bool exists = blob1.Exists();
-                               return exists;
-                           }, timeout: 10 * 1000).Wait();
+                    try
+                    {
+                        // Wait for initial execution.
+                        TestHelpers.Await(() =>
+                        {
+                            bool exists = blob1.Exists();
+                            return exists;
+                        }, timeout: 10 * 1000).Wait();
 
-                           // This changes the bindings so that we now write to blob2
-                           var blob2 = UpdateOutputName("first", "second", fixture);
+                        // This changes the bindings so that we now write to blob2
+                        var blob2 = UpdateOutputName("first", "testblob", fixture);
 
-                           // wait for newly executed
-                           TestHelpers.Await(() =>
-                           {
-                               bool exists = blob2.Exists();
-                               return exists;
-                           }, timeout: 30 * 1000).Wait();
-                       }
-                       catch (Exception ex)
-                       {
-                           exception = ExceptionDispatchInfo.Capture(ex);
-                       }
+                        // wait for newly executed
+                        TestHelpers.Await(() =>
+                        {
+                            bool exists = blob2.Exists();
+                            return exists;
+                        }, timeout: 30 * 1000).Wait();
+                    }
+                    catch (Exception ex)
+                    {
+                        exception = ExceptionDispatchInfo.Capture(ex);
+                    }
+                    finally
+                    {
+                        try
+                        {
+                            UpdateOutputName("first", "testblob", fixture);
+                        }
+                        catch
+                        {
+                        }
+                    }
 
-                       cts.Cancel();
-                   });
+                    cts.Cancel();
+                });
+                t.Start();
+
+                manager.RunAndBlock(cts.Token);
+
+                t.Join();
+
+                Assert.True(exception == null, exception?.SourceException?.ToString());
+            }
+        }
+
+        [Fact]
+        public async Task RenameFunctionAndRestart()
+        {
+            var oldDirectory = Path.Combine(Directory.GetCurrentDirectory(), "TestScripts/Node/TimerTrigger");
+            var newDirectory = Path.Combine(Directory.GetCurrentDirectory(), "TestScripts/Node/MovedTrigger");
+
+            CancellationTokenSource cts = new CancellationTokenSource();
+            var fixture = new NodeEndToEndTests.TestFixture();
+            await fixture.Host.StopAsync();
+            var config = fixture.Host.ScriptConfig;
+
+            var blob = fixture.TestOutputContainer.GetBlockBlobReference("testblob");
+
+            ExceptionDispatchInfo exception = null;
+            var mockEnvironment = new Mock<IScriptHostEnvironment>();
+            using (var eventManager = new ScriptEventManager())
+            using (var manager = new ScriptHostManager(config, eventManager, mockEnvironment.Object))
+            using (var resetEvent = new ManualResetEventSlim())
+            {
+                mockEnvironment.Setup(e => e.RestartHost())
+                    .Callback(() =>
+                    {
+                        resetEvent.Set();
+                        manager.RestartHost();
+                    });
+
+                // Background task to run while the main thread is pumping events at RunAndBlock().
+                Thread t = new Thread(_ =>
+                {
+                    // don't start until the manager is running
+                    TestHelpers.Await(() => manager.State == ScriptHostState.Running).Wait();
+
+                    try
+                    {
+                        // Wait for initial execution.
+                        TestHelpers.Await(() =>
+                        {
+                            bool exists = blob.Exists();
+                            return exists;
+                        }, timeout: 10 * 1000).Wait();
+
+                        // find __dirname from blob
+                        string text;
+                        using (var stream = new MemoryStream())
+                        {
+                            blob.DownloadToStream(stream);
+                            text = System.Text.Encoding.UTF8.GetString(stream.ToArray());
+                        }
+
+                        Assert.Contains("TimerTrigger", text);
+
+                        // rename directory & delete old blob
+                        Directory.Move(oldDirectory, newDirectory);
+
+                        resetEvent.Wait(TimeSpan.FromSeconds(10));
+
+                        blob.Delete();
+
+                        // wait for newly executed
+                        TestHelpers.Await(() =>
+                        {
+                            bool exists = blob.Exists();
+                            return exists;
+                        }, timeout: 30 * 1000).Wait();
+
+                        using (var stream = new MemoryStream())
+                        {
+                            blob.DownloadToStream(stream);
+                            text = System.Text.Encoding.UTF8.GetString(stream.ToArray());
+                        }
+
+                        Assert.Contains("MovedTrigger", text);
+                    }
+                    catch (Exception ex)
+                    {
+                        exception = ExceptionDispatchInfo.Capture(ex);
+                    }
+                    finally
+                    {
+                        try
+                        {
+                            Directory.Move(newDirectory, oldDirectory);
+                        }
+                        catch
+                        {
+                        }
+                    }
+
+                    cts.Cancel();
+                });
                 t.Start();
 
                 manager.RunAndBlock(cts.Token);
@@ -91,12 +206,13 @@ namespace Microsoft.Azure.WebJobs.Script.Tests
                 RootScriptPath = Environment.CurrentDirectory
             };
 
-            var hostMock = new Mock<ScriptHost>(config);
+            var eventManager = new Mock<IScriptEventManager>();
+            var hostMock = new Mock<ScriptHost>(new NullScriptHostEnvironment(), eventManager.Object, config, null);
             var factoryMock = new Mock<IScriptHostFactory>();
-            factoryMock.Setup(f => f.Create(_settingsManager, It.IsAny<ScriptHostConfiguration>()))
+            factoryMock.Setup(f => f.Create(It.IsAny<IScriptHostEnvironment>(), It.IsAny<IScriptEventManager>(), _settingsManager, It.IsAny<ScriptHostConfiguration>()))
                 .Returns(hostMock.Object);
 
-            var target = new Mock<ScriptHostManager>(config, _settingsManager, factoryMock.Object);
+            var target = new Mock<ScriptHostManager>(config, _settingsManager, factoryMock.Object, eventManager.Object, new NullScriptHostEnvironment());
             target.Protected().Setup("OnHostStarted")
                 .Throws(new Exception());
 
@@ -121,7 +237,8 @@ namespace Microsoft.Azure.WebJobs.Script.Tests
             {
                 Throw = true
             };
-            var hostManager = new ScriptHostManager(config, _settingsManager, scriptHostFactory);
+            var eventManagerMock = new Mock<IScriptEventManager>();
+            var hostManager = new ScriptHostManager(config, _settingsManager, scriptHostFactory, eventManagerMock.Object);
             Task taskIgnore = Task.Run(() => hostManager.RunAndBlock());
 
             // we expect a host exception immediately
@@ -166,7 +283,9 @@ namespace Microsoft.Azure.WebJobs.Script.Tests
                 RootLogPath = logDir,
                 FileLoggingMode = FileLoggingMode.Always
             };
-            ScriptHostManager hostManager = new ScriptHostManager(config);
+
+            var eventManagerMock = new Mock<IScriptEventManager>();
+            ScriptHostManager hostManager = new ScriptHostManager(config, eventManagerMock.Object);
 
             Task runTask = Task.Run(() => hostManager.RunAndBlock());
 
@@ -186,9 +305,135 @@ namespace Microsoft.Azure.WebJobs.Script.Tests
             Assert.Contains("Job host stopped", hostLogs);
         }
 
+        [Fact]
+        public void Restart_CreatesNew_FunctionTraceWriter()
+        {
+            string functionDir = @"TestScripts\CSharp";
+            var traceWriter = new TestTraceWriter(System.Diagnostics.TraceLevel.Info);
+            ScriptHostConfiguration config = new ScriptHostConfiguration
+            {
+                RootScriptPath = functionDir,
+                FileLoggingMode = FileLoggingMode.Always,
+                TraceWriter = traceWriter
+            };
+
+            string hostJsonPath = Path.Combine(functionDir, ScriptConstants.HostMetadataFileName);
+            string originalHostJson = File.ReadAllText(hostJsonPath);
+
+            // Only load two functions to start:
+            JObject hostConfig = new JObject
+            {
+                { "id", "123456" },
+                { "functions", new JArray("ManualTrigger", "Scenarios") }
+            };
+            File.WriteAllText(hostJsonPath, hostConfig.ToString());
+
+            CancellationTokenSource cts = new CancellationTokenSource();
+            ExceptionDispatchInfo exception = null;
+
+            try
+            {
+                using (var manager = new ScriptHostManager(config))
+                {
+                    // Background task to run while the main thread is pumping events at RunAndBlock().
+                    Thread t = new Thread(_ =>
+                    {
+                        try
+                        {
+                            // don't start until the manager is running
+                            TestHelpers.Await(() => manager.State == ScriptHostState.Running).Wait();
+
+                            var firstFileWriters = GetRemovableTraceWriters(manager.Instance);
+                            Assert.Equal(2, firstFileWriters.Count());
+
+                            // update the host.json to only have one function
+                            hostConfig["functions"] = new JArray("ManualTrigger");
+                            traceWriter.Traces.Clear();
+                            File.WriteAllText(hostJsonPath, hostConfig.ToString());
+                            TestHelpers.Await(() => traceWriter.Traces.Select(p => p.Message).Contains("Job host started")).Wait();
+                            TestHelpers.Await(() => manager.State == ScriptHostState.Running).Wait();
+
+                            var secondFileWriters = GetRemovableTraceWriters(manager.Instance);
+                            Assert.Equal(1, secondFileWriters.Count());
+
+                            // make sure we have a new instance of the ManualTrigger writer and that it does
+                            // not throw an ObjectDisposedException when we use it
+                            Assert.DoesNotContain(secondFileWriters.Single(), firstFileWriters);
+                            secondFileWriters.Single().Info("test");
+
+                            // add back the other function -- make sure the writer is not disposed
+                            hostConfig["functions"] = new JArray("ManualTrigger", "Scenarios");
+                            traceWriter.Traces.Clear();
+                            File.WriteAllText(hostJsonPath, hostConfig.ToString());
+                            TestHelpers.Await(() => traceWriter.Traces.Select(p => p.Message).Contains("Job host started")).Wait();
+                            TestHelpers.Await(() => manager.State == ScriptHostState.Running).Wait();
+
+                            var thirdFileWriters = GetRemovableTraceWriters(manager.Instance);
+                            Assert.Equal(2, thirdFileWriters.Count());
+
+                            // make sure these are all new and that they also do not throw
+                            var previousWriters = firstFileWriters.Concat(secondFileWriters);
+                            Assert.DoesNotContain(thirdFileWriters.First(), previousWriters);
+                            Assert.DoesNotContain(thirdFileWriters.Last(), previousWriters);
+                            thirdFileWriters.First().Info("test");
+                            thirdFileWriters.Last().Info("test");
+                        }
+                        catch (Exception ex)
+                        {
+                            exception = ExceptionDispatchInfo.Capture(ex);
+                        }
+                        finally
+                        {
+                            cts.Cancel();
+                        }
+                    });
+                    t.Start();
+                    manager.RunAndBlock(cts.Token);
+                    t.Join();
+                }
+
+                Assert.True(exception == null, exception?.SourceException?.ToString());
+            }
+            finally
+            {
+                File.WriteAllText(hostJsonPath, originalHostJson);
+            }
+        }
+
+        private static IEnumerable<RemovableTraceWriter> GetRemovableTraceWriters(ScriptHost host)
+        {
+            List<RemovableTraceWriter> removableTraceWriters = new List<RemovableTraceWriter>();
+
+            foreach (var function in host.Functions)
+            {
+                var invokerBase = function.Invoker as FunctionInvokerBase;
+                if (invokerBase == null)
+                {
+                    continue;
+                }
+
+                RemovableTraceWriter instance = null;
+                if (invokerBase.FileTraceWriter is ConditionalTraceWriter conditional)
+                {
+                    instance = conditional.InnerWriter as RemovableTraceWriter;
+                }
+                else
+                {
+                    instance = invokerBase.FileTraceWriter as RemovableTraceWriter;
+                }
+
+                if (instance != null)
+                {
+                    removableTraceWriters.Add(instance);
+                }
+            }
+
+            return removableTraceWriters;
+        }
+
         // Update the manifest for the timer function
         // - this will cause a file touch which cause ScriptHostManager to notice and update
-        // - set to a new output location so that we can ensure we're getting new changes. 
+        // - set to a new output location so that we can ensure we're getting new changes.
         private static CloudBlockBlob UpdateOutputName(string prev, string hint, EndToEndTestFixture fixture)
         {
             string name = hint;
@@ -207,7 +452,7 @@ namespace Microsoft.Azure.WebJobs.Script.Tests
         {
             public bool Throw { get; set; }
 
-            public ScriptHost Create(ScriptSettingsManager settingsManager, ScriptHostConfiguration config)
+            public ScriptHost Create(IScriptHostEnvironment environment, IScriptEventManager eventManager, ScriptSettingsManager settingsManager, ScriptHostConfiguration config)
             {
                 if (Throw)
                 {
@@ -216,12 +461,12 @@ namespace Microsoft.Azure.WebJobs.Script.Tests
 
                 var mockMetricsLogger = new Mock<IMetricsLogger>(MockBehavior.Strict);
                 config.HostConfig.AddService<IMetricsLogger>(mockMetricsLogger.Object);
-                mockMetricsLogger.Setup(p => p.BeginEvent(It.IsAny<string>())).Returns(new object());
+                mockMetricsLogger.Setup(p => p.BeginEvent(It.IsAny<string>(), It.IsAny<string>())).Returns(new object());
                 mockMetricsLogger.Setup(p => p.EndEvent(It.IsAny<object>()));
-                mockMetricsLogger.Setup(p => p.LogEvent(It.IsAny<string>()));
+                mockMetricsLogger.Setup(p => p.LogEvent(It.IsAny<string>(), It.IsAny<string>()));
                 mockMetricsLogger.Setup(p => p.LogEvent(It.IsAny<MetricEvent>()));
 
-                return ScriptHost.Create(settingsManager, config);
+                return ScriptHost.Create(environment, eventManager, config, settingsManager);
             }
         }
     }

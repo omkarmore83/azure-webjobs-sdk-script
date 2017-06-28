@@ -12,18 +12,15 @@ using Microsoft.Azure.WebJobs.ServiceBus;
 using Microsoft.ServiceBus.Messaging;
 using Newtonsoft.Json.Linq;
 
-namespace Microsoft.Azure.WebJobs.Script
+namespace Microsoft.Azure.WebJobs.Script.Binding
 {
-    [CLSCompliant(false)]
-    public class ServiceBusScriptBindingProvider : ScriptBindingProvider
+    internal class ServiceBusScriptBindingProvider : ScriptBindingProvider
     {
-        private readonly string _serviceBusAssemblyName;
         private EventHubConfiguration _eventHubConfiguration;
 
         public ServiceBusScriptBindingProvider(JobHostConfiguration config, JObject hostMetadata, TraceWriter traceWriter)
             : base(config, hostMetadata, traceWriter)
         {
-            _serviceBusAssemblyName = typeof(BrokeredMessage).Assembly.GetName().Name;
         }
 
         public override bool TryCreate(ScriptBindingContext context, out ScriptBinding binding)
@@ -70,6 +67,7 @@ namespace Microsoft.Azure.WebJobs.Script
 
             EventProcessorOptions eventProcessorOptions = EventProcessorOptions.DefaultOptions;
             eventProcessorOptions.MaxBatchSize = 1000;
+            int batchCheckpointFrequency = 1;
             configSection = (JObject)Metadata.GetValue("eventHub", StringComparison.OrdinalIgnoreCase);
             if (configSection != null)
             {
@@ -82,8 +80,14 @@ namespace Microsoft.Azure.WebJobs.Script
                 {
                     eventProcessorOptions.PrefetchCount = (int)value;
                 }
+
+                if (configSection.TryGetValue("batchCheckpointFrequency", StringComparison.OrdinalIgnoreCase, out value))
+                {
+                    batchCheckpointFrequency = (int)value;
+                }
             }
             _eventHubConfiguration = new EventHubConfiguration(eventProcessorOptions);
+            _eventHubConfiguration.BatchCheckpointFrequency = batchCheckpointFrequency;
 
             Config.UseServiceBus(serviceBusConfig);
             Config.UseEventHub(_eventHubConfiguration);
@@ -93,12 +97,8 @@ namespace Microsoft.Azure.WebJobs.Script
         {
             assembly = null;
 
-            if (string.Compare(assemblyName, _serviceBusAssemblyName, StringComparison.OrdinalIgnoreCase) == 0)
-            {
-                assembly = typeof(BrokeredMessage).Assembly;
-            }
-
-            return assembly != null;
+            return Utility.TryMatchAssembly(assemblyName, typeof(BrokeredMessage), out assembly) ||
+                   Utility.TryMatchAssembly(assemblyName, typeof(ServiceBusAttribute), out assembly);
         }
 
         private class EventHubScriptBinding : ScriptBinding
@@ -181,6 +181,7 @@ namespace Microsoft.Azure.WebJobs.Script
             public ServiceBusScriptBinding(ScriptBindingContext context) : base(context)
             {
             }
+
             public override Type DefaultType
             {
                 get
@@ -206,31 +207,37 @@ namespace Microsoft.Azure.WebJobs.Script
                 string subscriptionName = Context.GetMetadataValue<string>("subscriptionName");
                 var accessRights = Context.GetMetadataEnumValue<Microsoft.ServiceBus.Messaging.AccessRights>("accessRights");
 
+                Attribute attribute = null;
                 if (Context.IsTrigger)
                 {
                     if (!string.IsNullOrEmpty(topicName) && !string.IsNullOrEmpty(subscriptionName))
                     {
-                        attributes.Add(new ServiceBusTriggerAttribute(topicName, subscriptionName, accessRights));
+                        attribute = new ServiceBusTriggerAttribute(topicName, subscriptionName, accessRights);
                     }
                     else if (!string.IsNullOrEmpty(queueName))
                     {
-                        attributes.Add(new ServiceBusTriggerAttribute(queueName, accessRights));
+                        attribute = new ServiceBusTriggerAttribute(queueName, accessRights);
                     }
                 }
                 else
                 {
-                    attributes.Add(new ServiceBusAttribute(queueName ?? topicName, accessRights));
+                    attribute = new ServiceBusAttribute(queueName ?? topicName, accessRights)
+                    {
+                        EntityType = string.IsNullOrEmpty(topicName) ? EntityType.Queue : EntityType.Topic
+                    };
                 }
 
-                if (attributes.Count == 0)
+                if (attribute == null)
                 {
                     throw new InvalidOperationException("Invalid ServiceBus trigger configuration.");
                 }
+                attributes.Add(attribute);
 
-                string account = Context.GetMetadataValue<string>("connection");
-                if (!string.IsNullOrEmpty(account))
+                var connectionProvider = (IConnectionProvider)attribute;
+                string connection = Context.GetMetadataValue<string>("connection");
+                if (!string.IsNullOrEmpty(connection))
                 {
-                    attributes.Add(new ServiceBusAccountAttribute(account));
+                    connectionProvider.Connection = connection;
                 }
 
                 return attributes;

@@ -10,5 +10,7 @@ namespace Microsoft.Azure.WebJobs.Script.WebHost
         public string MasterKey { get; set; }
 
         public Dictionary<string, string> FunctionKeys { get; set; }
+
+        public Dictionary<string, string> SystemKeys { get; set; }
     }
 }

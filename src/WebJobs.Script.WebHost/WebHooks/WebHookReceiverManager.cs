@@ -7,6 +7,7 @@ using System.Globalization;
 using System.Linq;
 using System.Net.Http;
 using System.Threading.Tasks;
+using System.Web;
 using System.Web.Http;
 using System.Web.Http.Controllers;
 using Autofac;
@@ -14,7 +15,9 @@ using Autofac.Integration.WebApi;
 using Microsoft.AspNet.WebHooks;
 using Microsoft.AspNet.WebHooks.Config;
 using Microsoft.Azure.WebJobs.Host;
+using Microsoft.Azure.WebJobs.Script.Binding;
 using Microsoft.Azure.WebJobs.Script.Description;
+using Microsoft.Azure.WebJobs.Script.WebHost.Filters;
 
 namespace Microsoft.Azure.WebJobs.Script.WebHost.WebHooks
 {
@@ -55,8 +58,8 @@ namespace Microsoft.Azure.WebJobs.Script.WebHost.WebHooks
         {
             // First check if there is a registered WebHook Receiver for this request, and if
             // so use it
-            HttpTriggerBindingMetadata httpFunctionMetadata = (HttpTriggerBindingMetadata)function.Metadata.InputBindings.FirstOrDefault(p => string.Compare("HttpTrigger", p.Type, StringComparison.OrdinalIgnoreCase) == 0);
-            string webHookReceiver = httpFunctionMetadata.WebHookType;
+            var httpTrigger = function.GetTriggerAttributeOrNull<HttpTriggerAttribute>();
+            string webHookReceiver = httpTrigger.WebHookType;
             IWebHookReceiver receiver = null;
             if (string.IsNullOrEmpty(webHookReceiver) || !_receiverLookup.TryGetValue(webHookReceiver, out receiver))
             {
@@ -66,6 +69,10 @@ namespace Microsoft.Azure.WebJobs.Script.WebHost.WebHooks
 
                 return new HttpResponseMessage(System.Net.HttpStatusCode.InternalServerError);
             }
+
+            // if the code value is specified via header rather than query string
+            // promote it to the query string (that's what the WebHook library expects)
+            ApplyHeaderValuesToQuery(request);
 
             HttpRequestContext context = new HttpRequestContext
             {
@@ -90,6 +97,25 @@ namespace Microsoft.Azure.WebJobs.Script.WebHost.WebHooks
             string webhookId = $"{receiverId},{clientId}";
 
             return await receiver.ReceiveAsync(webhookId, context, request);
+        }
+
+        internal static void ApplyHeaderValuesToQuery(HttpRequestMessage request)
+        {
+            var query = HttpUtility.ParseQueryString(request.RequestUri.Query);
+            IEnumerable<string> values = null;
+            if (request.Headers.TryGetValues(AuthorizationLevelAttribute.FunctionsKeyHeaderName, out values) &&
+                string.IsNullOrEmpty(query.Get("code")))
+            {
+                string value = values.FirstOrDefault();
+                if (!string.IsNullOrEmpty(value))
+                {
+                    query["code"] = value;
+                }
+
+                UriBuilder builder = new UriBuilder(request.RequestUri);
+                builder.Query = query.ToString();
+                request.RequestUri = builder.Uri;
+            }
         }
 
         private static string GetClientID(HttpRequestMessage request)
@@ -144,8 +170,7 @@ namespace Microsoft.Azure.WebJobs.Script.WebHost.WebHooks
                 // now need to dispatch it to the actual function.
 
                 // get the callback from request properties
-                var requestHandler = (Func<HttpRequestMessage, Task<HttpResponseMessage>>)
-                    context.Request.Properties[AzureFunctionsCallbackKey];
+                var requestHandler = (Func<HttpRequestMessage, Task<HttpResponseMessage>>)context.Request.Properties[AzureFunctionsCallbackKey];
 
                 context.Request.Properties.Add(ScriptConstants.AzureFunctionsWebHookContextKey, context);
 

@@ -1,6 +1,7 @@
 ﻿// Copyright (c) .NET Foundation. All rights reserved.
 // Licensed under the MIT License. See License.txt in the project root for license information.
 
+using System;
 using System.Collections.Generic;
 using System.Linq;
 using Newtonsoft.Json;
@@ -26,7 +27,9 @@ namespace Microsoft.Azure.WebJobs.Script.WebHost
         public override bool HasStaleKeys => Keys?.Any(k => k.IsStale) ?? false;
 
         [JsonIgnore]
-        protected override ICollection<Key> InnerFunctionKeys => Keys;
+        public override ScriptSecretsType SecretsType => ScriptSecretsType.Function;
+
+        protected override ICollection<Key> GetKeys(string keyScope) => Keys;
 
         public override ScriptSecrets Refresh(IKeyValueConverterFactory factory)
         {

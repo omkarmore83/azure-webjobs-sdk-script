@@ -8,9 +8,14 @@ using System.Diagnostics;
 using System.Globalization;
 using System.IO;
 using System.Linq;
+using System.Reflection;
+using System.Security.Cryptography;
+using System.Text;
 using System.Threading.Tasks;
 using Microsoft.Azure.WebJobs.Host;
+using Microsoft.Azure.WebJobs.Logging;
 using Microsoft.Azure.WebJobs.Script.Config;
+using Microsoft.Extensions.Logging;
 using Newtonsoft.Json.Linq;
 using NuGet.Frameworks;
 using NuGet.LibraryModel;
@@ -26,30 +31,31 @@ namespace Microsoft.Azure.WebJobs.Script.Description
         private const string NugetPathEnvironmentKey = "AzureWebJobs_NuGetPath";
         private const string NuGetFileName = "nuget.exe";
 
-        private readonly FunctionMetadata _functionMetadata;
+        private readonly string _functionDirectory;
         private readonly TraceWriter _traceWriter;
+        private readonly ILogger _logger;
 
-        public PackageManager(FunctionMetadata metadata, TraceWriter traceWriter)
+        public PackageManager(string workingDirectory, TraceWriter traceWriter, ILoggerFactory loggerFactory)
         {
-            _functionMetadata = metadata;
+            _functionDirectory = workingDirectory;
             _traceWriter = traceWriter;
+            _logger = loggerFactory?.CreateLogger(LogCategories.Startup);
         }
 
-        public Task RestorePackagesAsync()
+        public Task<PackageRestoreResult> RestorePackagesAsync()
         {
-            var tcs = new TaskCompletionSource<bool>();
+            var tcs = new TaskCompletionSource<PackageRestoreResult>();
 
-            string functionDirectory = null;
             string projectPath = null;
             string nugetHome = null;
             string nugetFilePath = null;
-
+            string currentLockFileHash = null;
             try
             {
-                functionDirectory = Path.GetDirectoryName(_functionMetadata.ScriptFile);
-                projectPath = Path.Combine(functionDirectory, DotNetConstants.ProjectFileName);
+                projectPath = Path.Combine(_functionDirectory, DotNetConstants.ProjectFileName);
                 nugetHome = GetNugetPackagesPath();
                 nugetFilePath = ResolveNuGetPath();
+                currentLockFileHash = GetCurrentLockFileHash(_functionDirectory);
 
                 var startInfo = new ProcessStartInfo
                 {
@@ -59,7 +65,7 @@ namespace Microsoft.Azure.WebJobs.Script.Description
                     CreateNoWindow = true,
                     UseShellExecute = false,
                     ErrorDialog = false,
-                    WorkingDirectory = functionDirectory,
+                    WorkingDirectory = _functionDirectory,
                     Arguments = string.Format(CultureInfo.InvariantCulture, "restore \"{0}\" -PackagesDirectory \"{1}\"", projectPath, nugetHome)
                 };
 
@@ -70,11 +76,20 @@ namespace Microsoft.Azure.WebJobs.Script.Description
 
                 process.Exited += (s, e) =>
                 {
-                    tcs.SetResult(process.ExitCode == 0);
+                    string newLockFileHash = GetCurrentLockFileHash(_functionDirectory);
+                    var result = new PackageRestoreResult
+                    {
+                        IsInitialInstall = string.IsNullOrEmpty(currentLockFileHash),
+                        ReferencesChanged = !string.Equals(currentLockFileHash, newLockFileHash),
+                    };
+
+                    tcs.SetResult(result);
                     process.Close();
                 };
 
-                _traceWriter.Info("Starting NuGet restore");
+                string message = "Starting NuGet restore";
+                _traceWriter.Info(message);
+                _logger?.LogInformation(message);
 
                 process.Start();
 
@@ -83,11 +98,15 @@ namespace Microsoft.Azure.WebJobs.Script.Description
             }
             catch (Exception exc)
             {
-                _traceWriter.Error($@"NuGet restore failed with message: '{exc.Message}'
-Function directory: {functionDirectory}
+                string message = $@"NuGet restore failed with message: '{exc.Message}'
+Function directory: {_functionDirectory}
 Project path: {projectPath}
-Packages path: {nugetHome},
-Nuget client path: {nugetFilePath}");
+Packages path: {nugetHome}
+Nuget client path: {nugetFilePath}
+Lock file hash: {currentLockFileHash}";
+
+                _traceWriter.Error(message);
+                _logger?.LogError(message);
 
                 tcs.SetException(exc);
             }
@@ -95,23 +114,41 @@ Nuget client path: {nugetFilePath}");
             return tcs.Task;
         }
 
-        public static string ResolveNuGetPath(string baseKuduPath = null)
+        internal static string GetCurrentLockFileHash(string functionDirectory)
+        {
+            string lockFilePath = Path.Combine(functionDirectory, DotNetConstants.ProjectLockFileName);
+
+            if (!File.Exists(lockFilePath))
+            {
+                return string.Empty;
+            }
+
+            using (var md5 = MD5.Create())
+            {
+                using (var stream = File.OpenRead(lockFilePath))
+                {
+                    byte[] hash = md5.ComputeHash(stream);
+
+                    return hash
+                        .Aggregate(new StringBuilder(), (a, b) => a.Append(b.ToString("x2")))
+                        .ToString();
+                }
+            }
+        }
+
+        public static string ResolveNuGetPath()
         {
             // Check if we have the path in the well known environment variable
             string path = ScriptSettingsManager.Instance.GetSetting(NugetPathEnvironmentKey);
 
-            //// If we don't have the path, try to get a fully qualified path to Kudu's NuGet copy.
+            //// If we don't have the path, get the runtime's copy of NuGet
             if (string.IsNullOrEmpty(path))
             {
-                // Get the latest Kudu extension path
-                string kuduFolder = baseKuduPath ?? Environment.ExpandEnvironmentVariables("%programfiles(x86)%\\siteextensions\\kudu");
-                string kuduPath = Directory.Exists(kuduFolder)
-                    ? Directory.GetDirectories(kuduFolder).OrderByDescending(d => d).FirstOrDefault()
-                    : null;
+                string runtimeNugetPath = Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "bin\\tools", NuGetFileName);
 
-                if (!string.IsNullOrEmpty(kuduPath))
+                if (File.Exists(runtimeNugetPath))
                 {
-                    path = Path.Combine(kuduPath, "bin\\scripts", NuGetFileName);
+                    path = runtimeNugetPath;
                 }
             }
 
@@ -125,7 +162,7 @@ Nuget client path: {nugetFilePath}");
 
             if (!File.Exists(projectFilePath))
             {
-                // If there's no project.json, we can just return from here 
+                // If there's no project.json, we can just return from here
                 // as there's nothing to restore
                 return false;
             }
@@ -134,14 +171,14 @@ Nuget client path: {nugetFilePath}");
 
             if (!File.Exists(lockFilePath))
             {
-                // If have a project.json and no lock file, we need to 
+                // If have a project.json and no lock file, we need to
                 // restore the packages, just return true and skip validation
                 return true;
             }
 
             // This mimics the logic used by Nuget to validate a lock file against a given project.json file.
             // In order to determine whether we have a match, we:
-            //  - Read the project frameworks and their dependencies, 
+            //  - Read the project frameworks and their dependencies,
             //      extracting the appropriate version range using the lock file format
             //  - Read the lock file depenency groups
             //  - Ensure that each project dependency matches a dependency in the lock file for the
@@ -281,7 +318,9 @@ Nuget client path: {nugetFilePath}");
 
         private void ProcessDataReceived(object sender, DataReceivedEventArgs e)
         {
-            _traceWriter.Info(e.Data ?? string.Empty);
+            string message = e.Data ?? string.Empty;
+            _traceWriter.Info(message);
+            _logger?.LogInformation(message);
         }
 
         private class FrameworkInfo

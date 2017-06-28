@@ -3,6 +3,7 @@
 
 using System;
 using System.Collections.Generic;
+using System.IO;
 using System.Linq;
 using System.Management.Automation;
 using System.Net;
@@ -10,6 +11,7 @@ using System.Net.Http;
 using System.Net.Http.Headers;
 using System.Threading.Tasks;
 using System.Web.Http;
+using Microsoft.Azure.WebJobs.Extensions.Http;
 using Microsoft.Azure.WebJobs.Host;
 using Microsoft.WindowsAzure.Storage.Blob;
 using Newtonsoft.Json.Linq;
@@ -105,7 +107,7 @@ namespace Microsoft.Azure.WebJobs.Script.Tests
                 { "category", "produce" },
                 { "id", "789" }
             };
-            request.Properties.Add(ScriptConstants.AzureFunctionsHttpRouteDataKey, routeData);
+            request.Properties.Add(HttpExtensionConstants.AzureWebJobsHttpRouteDataKey, routeData);
 
             Dictionary<string, object> arguments = new Dictionary<string, object>
             {
@@ -183,6 +185,7 @@ namespace Microsoft.Azure.WebJobs.Script.Tests
             string result = await response.Content.ReadAsStringAsync();
             JObject resultObject = JObject.Parse(result);
             Assert.Equal(testData, (string)resultObject["result"]["message"]["value"]);
+            Assert.Equal("text/plain; charset=utf-8", (string)resultObject["result"]["content-type"]);
         }
 
         [Fact]
@@ -209,6 +212,31 @@ namespace Microsoft.Azure.WebJobs.Script.Tests
             Assert.Equal("<HEAD><TITLE>Azure Functions!!!</TITLE></HEAD>", result);
         }
 
+        [Fact]
+        public async Task HttpTriggerExecutionContext_Get_ReturnsContextProperties()
+        {
+            string functionName = "HttpTrigger-ExecutionContext";
+            HttpRequestMessage request = new HttpRequestMessage
+            {
+                RequestUri = new Uri($"http://localhost/api/{functionName}?code=1388a6b0d05eca2237f10e4a4641260b0a08f3a5&name=testuser"),
+                Method = HttpMethod.Get
+            };
+            request.SetConfiguration(new HttpConfiguration());
+
+            Dictionary<string, object> arguments = new Dictionary<string, object>
+            {
+                { "req", request }
+            };
+            await Fixture.Host.CallAsync(functionName, arguments);
+
+            HttpResponseMessage response = (HttpResponseMessage)request.Properties[ScriptConstants.AzureFunctionsHttpResponseKey];
+            Assert.Equal(HttpStatusCode.OK, response.StatusCode);
+
+            string result = await response.Content.ReadAsStringAsync();
+            string functionDirectory = Path.Combine(Fixture.Host.ScriptConfig.RootScriptPath, functionName);
+            Assert.Equal($"FUNCTIONNAME={functionName},FUNCTIONDIRECTORY={functionDirectory}", result);
+        }
+
         public class TestFixture : EndToEndTestFixture
         {
             public TestFixture() : base(@"TestScripts\PowerShell", "powershell")
@@ -228,7 +256,7 @@ namespace Microsoft.Azure.WebJobs.Script.Tests
                 TestBlobName = Guid.NewGuid().ToString();
 
                 // write the test blob before the host starts, so it gets picked
-                // up relatively quickly by the blob trigger test               
+                // up relatively quickly by the blob trigger test
                 CloudBlockBlob inputBlob = TestInputContainer.GetBlockBlobReference(TestBlobName);
                 inputBlob.UploadText(TestBlobContents);
             }

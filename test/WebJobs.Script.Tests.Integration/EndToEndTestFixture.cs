@@ -7,12 +7,14 @@ using System.Linq;
 using System.Web.Http;
 using Microsoft.Azure.WebJobs.Host;
 using Microsoft.Azure.WebJobs.Script.Config;
+using Microsoft.Azure.WebJobs.Script.Eventing;
 using Microsoft.Azure.WebJobs.Script.WebHost;
 using Microsoft.ServiceBus;
 using Microsoft.WindowsAzure.Storage;
 using Microsoft.WindowsAzure.Storage.Blob;
 using Microsoft.WindowsAzure.Storage.Queue;
 using Microsoft.WindowsAzure.Storage.Table;
+using Moq;
 
 namespace Microsoft.Azure.WebJobs.Script.Tests
 {
@@ -45,12 +47,21 @@ namespace Microsoft.Azure.WebJobs.Script.Tests
             RequestConfiguration = new HttpConfiguration();
             RequestConfiguration.Formatters.Add(new PlaintextMediaTypeFormatter());
 
+            EventManager = new ScriptEventManager();
+            ScriptHostEnvironmentMock = new Mock<IScriptHostEnvironment>();
+
             // Reset the timer logs first, since one of the tests will
             // be checking them
             TestHelpers.ClearFunctionLogs("TimerTrigger");
-            Host = ScriptHost.Create(_settingsManager, config);
+            TestHelpers.ClearFunctionLogs("ListenerStartupException");
+
+            InitializeConfig(config);
+
+            Host = ScriptHost.Create(ScriptHostEnvironmentMock.Object, EventManager, config, _settingsManager);
             Host.Start();
         }
+
+        public Mock<IScriptHostEnvironment> ScriptHostEnvironmentMock { get; }
 
         public TestTraceWriter TraceWriter { get; private set; }
 
@@ -78,6 +89,12 @@ namespace Microsoft.Azure.WebJobs.Script.Tests
 
         public HttpConfiguration RequestConfiguration { get; }
 
+        public IScriptEventManager EventManager { get; }
+
+        protected virtual void InitializeConfig(ScriptHostConfiguration config)
+        {
+        }
+
         public CloudQueue GetNewQueue(string queueName)
         {
             var queue = QueueClient.GetQueueReference(string.Format("{0}-{1}", queueName, FixtureId));
@@ -98,6 +115,7 @@ namespace Microsoft.Azure.WebJobs.Script.Tests
 
             TestInputContainer = BlobClient.GetContainerReference(string.Format("test-input-{0}", FixtureId));
             TestInputContainer.CreateIfNotExists();
+
             // Processing a large number of blobs on startup can take a while,
             // so let's start with an empty container.
             TestHelpers.ClearContainer(TestInputContainer);
@@ -172,7 +190,9 @@ namespace Microsoft.Azure.WebJobs.Script.Tests
         private class TestEntity : TableEntity
         {
             public string Name { get; set; }
+
             public string Region { get; set; }
+
             public int Status { get; set; }
         }
     }

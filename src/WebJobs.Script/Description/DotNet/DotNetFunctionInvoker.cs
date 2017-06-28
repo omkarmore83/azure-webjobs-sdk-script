@@ -18,10 +18,10 @@ using Microsoft.Azure.WebJobs.Script.Binding;
 using Microsoft.Azure.WebJobs.Script.Diagnostics;
 using Microsoft.CodeAnalysis;
 using Microsoft.CodeAnalysis.Scripting;
+using Microsoft.Extensions.Logging;
 
 namespace Microsoft.Azure.WebJobs.Script.Description
 {
-    [CLSCompliant(false)]
     public sealed class DotNetFunctionInvoker : FunctionInvokerBase
     {
         private readonly FunctionAssemblyLoader _assemblyLoader;
@@ -29,29 +29,32 @@ namespace Microsoft.Azure.WebJobs.Script.Description
         private readonly Collection<FunctionBinding> _inputBindings;
         private readonly Collection<FunctionBinding> _outputBindings;
         private readonly IFunctionEntryPointResolver _functionEntryPointResolver;
-        private readonly ICompilationService _compilationService;
+        private readonly ICompilationService<IDotNetCompilation> _compilationService;
         private readonly FunctionLoader<MethodInfo> _functionLoader;
         private readonly IMetricsLogger _metricsLogger;
 
         private FunctionSignature _functionSignature;
         private IFunctionMetadataResolver _metadataResolver;
-        private Action _reloadScript;
+        private Func<Task> _reloadScript;
+        private Action _onReferencesChanged;
         private Action _restorePackages;
         private Action<MethodInfo, object[], object[], object> _resultProcessor;
         private string[] _watchedFileTypes;
 
-        private static readonly string[] AssemblyFileTypes = { ".dll", ".exe" };
-
-        internal DotNetFunctionInvoker(ScriptHost host, FunctionMetadata functionMetadata,
-            Collection<FunctionBinding> inputBindings, Collection<FunctionBinding> outputBindings,
-            IFunctionEntryPointResolver functionEntryPointResolver, FunctionAssemblyLoader assemblyLoader,
-            ICompilationServiceFactory compilationServiceFactory, ITraceWriterFactory traceWriterFactory = null)
-            : base(host, functionMetadata, traceWriterFactory)
+        internal DotNetFunctionInvoker(ScriptHost host,
+            FunctionMetadata functionMetadata,
+            Collection<FunctionBinding> inputBindings,
+            Collection<FunctionBinding> outputBindings,
+            IFunctionEntryPointResolver functionEntryPointResolver,
+            FunctionAssemblyLoader assemblyLoader,
+            ICompilationServiceFactory<ICompilationService<IDotNetCompilation>, IFunctionMetadataResolver> compilationServiceFactory,
+            IFunctionMetadataResolver metadataResolver = null)
+            : base(host, functionMetadata)
         {
             _metricsLogger = Host.ScriptConfig.HostConfig.GetService<IMetricsLogger>();
             _functionEntryPointResolver = functionEntryPointResolver;
             _assemblyLoader = assemblyLoader;
-            _metadataResolver = new FunctionMetadataResolver(functionMetadata, host.ScriptConfig.BindingProviders, TraceWriter);
+            _metadataResolver = metadataResolver ?? CreateMetadataResolver(host, functionMetadata, TraceWriter);
             _compilationService = compilationServiceFactory.CreateService(functionMetadata.ScriptType, _metadataResolver);
             _inputBindings = inputBindings;
             _outputBindings = outputBindings;
@@ -63,35 +66,59 @@ namespace Microsoft.Azure.WebJobs.Script.Description
 
             _functionLoader = new FunctionLoader<MethodInfo>(CreateFunctionTarget);
 
-            _reloadScript = ReloadScript;
+            _reloadScript = ReloadScriptAsync;
             _reloadScript = _reloadScript.Debounce();
+
+            _onReferencesChanged = OnReferencesChanged;
+            _onReferencesChanged = _onReferencesChanged.Debounce();
 
             _restorePackages = RestorePackages;
             _restorePackages = _restorePackages.Debounce();
+        }
+
+        private static IFunctionMetadataResolver CreateMetadataResolver(ScriptHost host, FunctionMetadata functionMetadata, TraceWriter traceWriter)
+        {
+            string functionScriptDirectory = Path.GetDirectoryName(functionMetadata.ScriptFile);
+            return new FunctionMetadataResolver(functionScriptDirectory, host.ScriptConfig.BindingProviders,
+                traceWriter, host.ScriptConfig.HostConfig.LoggerFactory);
         }
 
         private void InitializeFileWatcher()
         {
             if (InitializeFileWatcherIfEnabled())
             {
-                _watchedFileTypes = AssemblyFileTypes
+                _watchedFileTypes = ScriptConstants.AssemblyFileTypes
                     .Concat(_compilationService.SupportedFileTypes)
                     .ToArray();
             }
         }
 
-        protected override void OnScriptFileChanged(object sender, FileSystemEventArgs e)
+        protected override void OnScriptFileChanged(FileSystemEventArgs e)
         {
             // The ScriptHost is already monitoring for changes to function.json, so we skip those
             string fileExtension = Path.GetExtension(e.Name);
-            if (_watchedFileTypes.Contains(fileExtension))
+            if (ScriptConstants.AssemblyFileTypes.Contains(fileExtension, StringComparer.OrdinalIgnoreCase))
+            {
+                // As a result of an assembly change, we initiate a full host shutdown
+                _onReferencesChanged();
+            }
+            else if (_watchedFileTypes.Contains(fileExtension))
             {
                 _reloadScript();
             }
-            else if (string.Compare(DotNetConstants.ProjectFileName, e.Name, StringComparison.OrdinalIgnoreCase) == 0)
+            else if (string.Compare(DotNetConstants.ProjectFileName, Path.GetFileName(e.Name), StringComparison.OrdinalIgnoreCase) == 0)
             {
                 _restorePackages();
             }
+        }
+
+        private void OnReferencesChanged()
+        {
+            string message = "Assembly reference changes detected. Restarting host...";
+            TraceWriter.Info(message);
+            Logger?.LogInformation(message);
+
+            Host.Shutdown();
         }
 
         public override void OnError(Exception ex)
@@ -110,7 +137,7 @@ namespace Microsoft.Azure.WebJobs.Script.Description
             TraceError(error);
         }
 
-        private void ReloadScript()
+        private async Task ReloadScriptAsync()
         {
             // Reset cached function
             _functionLoader.Reset();
@@ -121,7 +148,7 @@ namespace Microsoft.Azure.WebJobs.Script.Description
 
             try
             {
-                ICompilation compilation = _compilationService.GetFunctionCompilation(Metadata);
+                IDotNetCompilation compilation = await _compilationService.GetFunctionCompilationAsync(Metadata);
                 compilationResult = compilation.GetDiagnostics();
 
                 signature = compilation.GetEntryPointSignature(_functionEntryPointResolver);
@@ -146,7 +173,7 @@ namespace Microsoft.Azure.WebJobs.Script.Description
                 (_functionSignature == null ||
                 (_functionSignature.HasLocalTypeReference || !_functionSignature.Equals(signature))))
             {
-                Host.RestartEvent.Set();
+                await Host.RestartAsync().ConfigureAwait(false);
             }
         }
 
@@ -172,25 +199,37 @@ namespace Microsoft.Azure.WebJobs.Script.Description
                 .ContinueWith(t => t.Exception.Handle(e => true), TaskContinuationOptions.OnlyOnFaulted | TaskContinuationOptions.ExecuteSynchronously);
         }
 
-        private async Task RestorePackagesAsync(bool reloadScriptOnSuccess = true)
+        internal async Task RestorePackagesAsync(bool reloadScriptOnSuccess = true)
         {
             TraceOnPrimaryHost("Restoring packages.", TraceLevel.Info);
 
             try
             {
-                await _metadataResolver.RestorePackagesAsync();
+                PackageRestoreResult result = await _metadataResolver.RestorePackagesAsync();
 
                 TraceOnPrimaryHost("Packages restored.", TraceLevel.Info);
 
                 if (reloadScriptOnSuccess)
                 {
-                    _reloadScript();
+                    if (!result.IsInitialInstall && result.ReferencesChanged)
+                    {
+                        TraceOnPrimaryHost("Package references have changed.", TraceLevel.Info);
+
+                        // If this is not the initial package install and references changed,
+                        // shutdown the host, which will cause it to have a clean start and load the new
+                        // assembly references
+                        _onReferencesChanged();
+                    }
+                    else
+                    {
+                        await _reloadScript();
+                    }
                 }
             }
             catch (Exception exc)
             {
                 TraceOnPrimaryHost("Package restore failed:", TraceLevel.Error);
-                TraceOnPrimaryHost(exc.ToString(), TraceLevel.Error);
+                TraceOnPrimaryHost(exc.ToFormattedString(), TraceLevel.Error);
             }
         }
 
@@ -238,8 +277,7 @@ namespace Microsoft.Azure.WebJobs.Script.Description
         {
             for (int i = 0; i < parameters.Length; i++)
             {
-                TraceWriter writer = parameters[i] as TraceWriter;
-                if (writer != null)
+                if (parameters[i] is TraceWriter writer)
                 {
                     parameters[i] = CreateUserTraceWriter(writer);
                 }
@@ -257,10 +295,10 @@ namespace Microsoft.Azure.WebJobs.Script.Description
                 string eventName = string.Format(MetricEventNames.FunctionCompileLatencyByLanguageFormat, _compilationService.Language);
                 using (_metricsLogger.LatencyEvent(eventName))
                 {
-                    ICompilation compilation = _compilationService.GetFunctionCompilation(Metadata);
+                    IDotNetCompilation compilation = await _compilationService.GetFunctionCompilationAsync(Metadata);
 
-                    Assembly assembly = compilation.EmitAndLoad(cancellationToken);
-                    _assemblyLoader.CreateOrUpdateContext(Metadata, assembly, _metadataResolver, TraceWriter);
+                    Assembly assembly = compilation.Emit(cancellationToken);
+                    _assemblyLoader.CreateOrUpdateContext(Metadata, assembly, _metadataResolver, TraceWriter, Host.ScriptConfig.HostConfig.LoggerFactory);
 
                     FunctionSignature functionSignature = compilation.GetEntryPointSignature(_functionEntryPointResolver);
 
@@ -269,10 +307,8 @@ namespace Microsoft.Azure.WebJobs.Script.Description
 
                     // Set our function entry point signature
                     _functionSignature = functionSignature;
-                    System.Reflection.TypeInfo scriptType = assembly.DefinedTypes
-                        .FirstOrDefault(t => string.Compare(t.Name, functionSignature.ParentTypeName, StringComparison.Ordinal) == 0);
 
-                    return _functionEntryPointResolver.GetFunctionEntryPoint(scriptType.DeclaredMethods.ToList());
+                    return _functionSignature.GetMethod(assembly);
                 }
             }
             catch (CompilationErrorException exc)
@@ -307,32 +343,6 @@ namespace Microsoft.Azure.WebJobs.Script.Description
             }
         }
 
-        internal void TraceCompilationDiagnostics(ImmutableArray<Diagnostic> diagnostics, LogTargets logTarget = LogTargets.All)
-        {
-            if (logTarget == LogTargets.None)
-            {
-                return;
-            }
-
-            TraceWriter traceWriter = TraceWriter;
-            IDictionary<string, object> properties = PrimaryHostTraceProperties;
-
-            if (!logTarget.HasFlag(LogTargets.User))
-            {
-                traceWriter = Host.TraceWriter;
-                properties = PrimaryHostSystemTraceProperties;
-            }
-            else if (!logTarget.HasFlag(LogTargets.System))
-            {
-                properties = PrimaryHostUserTraceProperties;
-            }
-
-            foreach (var diagnostic in diagnostics.Where(d => !d.IsSuppressed))
-            {
-                traceWriter.Trace(diagnostic.ToString(), diagnostic.Severity.ToTraceLevel(), properties);
-            }
-        }
-
         private ImmutableArray<Diagnostic> AddFunctionDiagnostics(ImmutableArray<Diagnostic> diagnostics)
         {
             var result = diagnostics.Aggregate(new List<Diagnostic>(), (a, d) =>
@@ -361,15 +371,18 @@ namespace Microsoft.Azure.WebJobs.Script.Description
                 Match match = Regex.Match(diagnostic.GetMessage(), messagePattern);
 
                 PackageReference package;
+
                 // If we have the assembly name argument, and it is a package assembly, add a compilation warning
                 if (match.Success && match.Groups["arg"] != null && _metadataResolver.TryGetPackageReference(match.Groups["arg"].Value, out package))
                 {
-                    string message = string.Format(CultureInfo.InvariantCulture,
+                    string message = string.Format(
+                        CultureInfo.InvariantCulture,
                         "The reference '{0}' is part of the referenced NuGet package '{1}'. Package assemblies are automatically referenced by your Function and do not require a '#r' directive.",
                         match.Groups["arg"].Value, package.Name);
 
-                    var descriptor = new DiagnosticDescriptor(DotNetConstants.RedundantPackageAssemblyReference,
-                       "Redundant assembly reference", message, "AzureFunctions", DiagnosticSeverity.Warning, true);
+                    var descriptor = new DiagnosticDescriptor(
+                        DotNetConstants.RedundantPackageAssemblyReference,
+                        "Redundant assembly reference", message, "AzureFunctions", DiagnosticSeverity.Warning, true);
 
                     return ImmutableArray.Create(Diagnostic.Create(descriptor, diagnostic.Location));
                 }
@@ -479,15 +492,6 @@ namespace Microsoft.Azure.WebJobs.Script.Description
             }
 
             return processor ?? ((_, __, ___, ____) => { /*noop*/ });
-        }
-
-        [Flags]
-        internal enum LogTargets
-        {
-            None = 0,
-            System = 1,
-            User = 2,
-            All = System | User
         }
     }
 }

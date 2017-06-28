@@ -3,54 +3,59 @@
 
 using System;
 using System.Collections.Generic;
-using System.Linq;
-using System.Text;
 using System.Threading.Tasks;
 using Microsoft.Azure.WebJobs.Host;
 using Microsoft.Azure.WebJobs.Script.WebHost;
+using Microsoft.Extensions.Logging;
 
 namespace Microsoft.Azure.WebJobs.Script.Tests
 {
     public class TestSecretManager : ISecretManager
     {
-        public virtual bool DeleteSecret(string secretName, string functionName = null)
+        public virtual Task PurgeOldSecretsAsync(string rootScriptPath, TraceWriter traceWriter, ILogger logger)
         {
-            return true;
+            throw new NotImplementedException();
         }
 
-        public virtual IDictionary<string, string> GetFunctionSecrets(string functionName, bool merged = false)
+        public virtual Task<bool> DeleteSecretAsync(string secretName, string keyScope, ScriptSecretsType secretsType)
         {
-            return new Dictionary<string, string>
+            return Task.FromResult(true);
+        }
+
+        public virtual Task<IDictionary<string, string>> GetFunctionSecretsAsync(string functionName, bool merged)
+        {
+            return Task.FromResult<IDictionary<string, string>>(new Dictionary<string, string>
             {
                 { "Key1", "Value1" },
                 { "Key2", "Value2" },
-            };
+            });
         }
 
-        public virtual HostSecretsInfo GetHostSecrets()
+        public virtual Task<HostSecretsInfo> GetHostSecretsAsync()
         {
-            return new HostSecretsInfo
+            return Task.FromResult(new HostSecretsInfo
             {
                 MasterKey = "1234",
                 FunctionKeys = new Dictionary<string, string>
                 {
                     { "HostKey1", "HostValue1" },
                     { "HostKey2", "HostValue2" },
+                },
+                SystemKeys = new Dictionary<string, string>
+                {
+                    { "SystemKey1", "HostValue1" },
+                    { "SystemKey2", "HostValue2" },
                 }
-            };
+            });
         }
 
-        public virtual void PurgeOldFiles(string rootScriptPath, TraceWriter traceWriter)
-        {
-        }
-
-        public virtual KeyOperationResult AddOrUpdateFunctionSecret(string secretName, string secret, string functionName = null)
+        public virtual Task<KeyOperationResult> AddOrUpdateFunctionSecretAsync(string secretName, string secret, string keyScope, ScriptSecretsType secretsType)
         {
             string resultSecret = secret ?? "generated";
-            return new KeyOperationResult(resultSecret, OperationResult.Created);
+            return Task.FromResult(new KeyOperationResult(resultSecret, OperationResult.Created));
         }
 
-        public KeyOperationResult SetMasterKey(string value = null)
+        public virtual Task<KeyOperationResult> SetMasterKeyAsync(string value)
         {
             throw new NotImplementedException();
         }

@@ -21,13 +21,14 @@ namespace Microsoft.Azure.WebJobs.Script.Host
                 rootPath = (string)args[0];
             }
 
-            ScriptHostConfiguration config = new ScriptHostConfiguration()
+            var config = new ScriptHostConfiguration()
             {
-                RootScriptPath = rootPath
+                RootScriptPath = rootPath,
+                IsSelfHost = true
             };
 
-            ScriptHostManager scriptHostManager = new ScriptHostManager(config);
+            var scriptHostManager = new ScriptHostManager(config);
             scriptHostManager.RunAndBlock();
-        }    
+        }
     }
 }

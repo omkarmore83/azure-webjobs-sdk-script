@@ -6,7 +6,8 @@
     <SkipCopyBuildProduct>true</SkipCopyBuildProduct>
     <ProjectGuid>{34AB8F63-18DE-4E0D-B21C-15E33B091634}</ProjectGuid>
     <TargetFrameworkVersion>v4.6</TargetFrameworkVersion>
-    <NuGetPackageImportStamp>d7fae0d2</NuGetPackageImportStamp>
+    <NuGetPackageImportStamp>
+    </NuGetPackageImportStamp>
     <TargetFrameworkProfile />
   </PropertyGroup>
   <PropertyGroup Condition=" '$(Configuration)|$(Platform)' == 'Debug|AnyCPU' ">
@@ -26,13 +27,13 @@
     </NuGetSpec>
   </ItemGroup>
   <ItemGroup>
-    <NuGetProject Include="..\WebJobs.Script.Extensibility.NuGet\WebJobs.Script.Extensibility.nuproj">
-      <Link>WebJobs.Script.Extensibility\WebJobs.Script.Extensibility.nuproj</Link>
+    <NuGetProject Include="..\WebJobs.Script.WebHost.NuGet\WebJobs.Script.WebHost.nuproj">
+      <Link>WebJobs.Script.WebHost\WebJobs.Script.WebHost.nuproj</Link>
     </NuGetProject>
   </ItemGroup>
   <ItemGroup>
-    <NuGetSpec Include="..\WebJobs.Script.Extensibility.NuGet\WebJobs.Script.Extensibility.nuspec">
-      <Link>WebJobs.Script.Extensibility\WebJobs.Script.Extensibility.nuspec</Link>
+    <NuGetSpec Include="..\WebJobs.Script.WebHost.NuGet\WebJobs.Script.WebHost.nuspec">
+      <Link>WebJobs.Script.WebHost\WebJobs.Script.WebHost.nuspec</Link>
     </NuGetSpec>
   </ItemGroup>
   <ItemGroup>
@@ -40,6 +41,13 @@
       <Link>NuGetProj.settings.targets</Link>
     </None>
     <None Include="app.config" />
+    <None Include="packages.config" />
+    <None Include="tools\install.ps1" />
+  </ItemGroup>
+  <ItemGroup>
+    <Analyzer Include="..\..\packages\StyleCop.Analyzers.1.1.0-beta001\analyzers\dotnet\cs\Newtonsoft.Json.dll" />
+    <Analyzer Include="..\..\packages\StyleCop.Analyzers.1.1.0-beta001\analyzers\dotnet\cs\StyleCop.Analyzers.CodeFixes.dll" />
+    <Analyzer Include="..\..\packages\StyleCop.Analyzers.1.1.0-beta001\analyzers\dotnet\cs\StyleCop.Analyzers.dll" />
   </ItemGroup>
   <Import Project="$(MSBuildToolsPath)\Microsoft.CSharp.targets" />
   <Target Name="Build">
@@ -53,7 +61,9 @@
     <PropertyGroup>
       <ErrorText>This project references NuGet package(s) that are missing on this computer. Enable NuGet Package Restore to download them.  For more information, see http://go.microsoft.com/fwlink/?LinkID=322105. The missing file is {0}.</ErrorText>
     </PropertyGroup>
+    <Error Condition="!Exists('..\..\packages\Microsoft.Bcl.Build.1.0.21\build\Microsoft.Bcl.Build.targets')" Text="$([System.String]::Format('$(ErrorText)', '..\..\packages\Microsoft.Bcl.Build.1.0.21\build\Microsoft.Bcl.Build.targets'))" />
   </Target>
+  <Import Project="..\..\packages\Microsoft.Bcl.Build.1.0.21\build\Microsoft.Bcl.Build.targets" Condition="Exists('..\..\packages\Microsoft.Bcl.Build.1.0.21\build\Microsoft.Bcl.Build.targets')" />
   <!-- To modify your build process, add your task inside one of the targets below and uncomment it. 
        Other similar extension points exist, see Microsoft.Common.targets.
   <Target Name="BeforeBuild">

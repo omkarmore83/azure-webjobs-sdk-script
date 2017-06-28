@@ -40,6 +40,7 @@ namespace Microsoft.Azure.WebJobs.Script.Tests
             // write a binary blob
             string name = Guid.NewGuid().ToString();
             CloudBlockBlob inputBlob = Fixture.TestInputContainer.GetBlockBlobReference(name);
+            inputBlob.Metadata.Add("TestMetadataKey", "TestMetadataValue");
             byte[] inputBytes = new byte[] { 1, 2, 3, 4, 5 };
             using (var stream = inputBlob.OpenWrite())
             {
@@ -61,7 +62,17 @@ namespace Microsoft.Azure.WebJobs.Script.Tests
             Assert.Equal(inputBytes, resultBytes);
             Assert.True((bool)testResult["isBuffer"]);
             Assert.Equal(5, (int)testResult["length"]);
-            Assert.Equal($"test-input-node/{name}", (string)testResult["path"]);
+
+            var blobMetadata = (JObject)testResult["blobMetadata"];
+            Assert.Equal($"test-input-node/{name}", (string)blobMetadata["path"]);
+
+            var metadata = (JObject)blobMetadata["metadata"];
+            Assert.Equal("TestMetadataValue", (string)metadata["testMetadataKey"]);
+
+            var properties = (JObject)blobMetadata["properties"];
+            Assert.Equal("application/octet-stream", (string)properties["contentType"]);
+            Assert.Equal("BlockBlob", (string)properties["blobType"]);
+            Assert.Equal(5, properties["length"]);
 
             string invocationId = (string)testResult["invocationId"];
             Guid.Parse(invocationId);
@@ -194,13 +205,18 @@ namespace Microsoft.Azure.WebJobs.Script.Tests
             };
             await Fixture.Host.CallAsync("EventHubSender", arguments);
 
-            // Second, there's an EventHub trigger listener on the events which will write a blob. 
+            // Second, there's an EventHub trigger listener on the events which will write a blob.
             // Once the blob is written, we know both sender & listener are working.
             var resultBlob = Fixture.TestOutputContainer.GetBlockBlobReference(testData);
             string result = await TestHelpers.WaitForBlobAndGetStringAsync(resultBlob);
 
-            var payload = JsonConvert.DeserializeObject<Payload>(result);
-            Assert.Equal(testData, payload.Id);
+            var payload = JObject.Parse(result);
+            Assert.Equal(testData, (string)payload["id"]);
+
+            var bindingData = payload["bindingData"];
+            int sequenceNumber = (int)bindingData["sequenceNumber"];
+            var systemProperties = bindingData["systemProperties"];
+            Assert.Equal(sequenceNumber, (int)systemProperties["sequenceNumber"]);
         }
 
         [Fact]
@@ -223,6 +239,9 @@ namespace Microsoft.Azure.WebJobs.Script.Tests
         [Fact]
         public async Task Scenario_Logging()
         {
+            // Sleep to make sure all logs from other "Scenarios" tests have flushed before
+            // we delete the file.
+            await Task.Delay(1000);
             TestHelpers.ClearFunctionLogs("Scenarios");
 
             string testData = Guid.NewGuid().ToString();
@@ -237,7 +256,12 @@ namespace Microsoft.Azure.WebJobs.Script.Tests
             };
             await Fixture.Host.CallAsync("Scenarios", arguments);
 
-            var logs = await TestHelpers.GetFunctionLogsAsync("Scenarios");
+            IList<string> logs = null;
+            await TestHelpers.Await(() =>
+            {
+                logs = TestHelpers.GetFunctionLogsAsync("Scenarios", throwOnNoLogs: false).Result;
+                return logs.Count > 0;
+            });
 
             // verify use of context.log to log complex objects
             TraceEvent scriptTrace = Fixture.TraceWriter.Traces.Single(p => p.Message.Contains(testData));
@@ -246,12 +270,38 @@ namespace Microsoft.Azure.WebJobs.Script.Tests
             Assert.Equal("This is a test", logEntry["message"]);
             Assert.Equal("v6.5.0", (string)logEntry["version"]);
             Assert.Equal(testData, logEntry["input"]);
+
+            // verify log levels in traces
+            TraceEvent[] traces = Fixture.TraceWriter.Traces.Where(t => t.Message.Contains("loglevel")).ToArray();
+            Assert.Equal(TraceLevel.Info, traces[0].Level);
+            Assert.Equal("loglevel default", traces[0].Message);
+            Assert.Equal(TraceLevel.Info, traces[1].Level);
+            Assert.Equal("loglevel info", traces[1].Message);
+            Assert.Equal(TraceLevel.Verbose, traces[2].Level);
+            Assert.Equal("loglevel verbose", traces[2].Message);
+            Assert.Equal(TraceLevel.Warning, traces[3].Level);
+            Assert.Equal("loglevel warn", traces[3].Message);
+            Assert.Equal(TraceLevel.Error, traces[4].Level);
+            Assert.Equal("loglevel error", traces[4].Message);
+
+            // verify logs made it to file logs
+            Assert.True(logs.Count == 15, string.Join(Environment.NewLine, logs));
+
+            // verify most of the logs look correct
+            Assert.EndsWith("Mathew Charles", logs[5]);
+            Assert.EndsWith("null", logs[6]);
+            Assert.EndsWith("1234", logs[7]);
+            Assert.EndsWith("true", logs[8]);
+            Assert.EndsWith("loglevel default", logs[9]);
+            Assert.EndsWith("loglevel info", logs[10]);
+            Assert.EndsWith("loglevel verbose", logs[11]);
+            Assert.EndsWith("loglevel warn", logs[12]);
+            Assert.EndsWith("loglevel error", logs[13]);
         }
 
-        [Fact]
-        public async Task Scenario_RandGuidBinding_GeneratesRandomIDs()
+        private async Task<CloudBlobContainer> GetEmptyContainer(string containerName)
         {
-            var container = Fixture.BlobClient.GetContainerReference("scenarios-output");
+            var container = Fixture.BlobClient.GetContainerReference(containerName);
             if (container.Exists())
             {
                 foreach (CloudBlockBlob blob in container.ListBlobs())
@@ -259,6 +309,13 @@ namespace Microsoft.Azure.WebJobs.Script.Tests
                     await blob.DeleteAsync();
                 }
             }
+            return container;
+        }
+
+        [Fact]
+        public async Task Scenario_RandGuidBinding_GeneratesRandomIDs()
+        {
+            var container = await GetEmptyContainer("scenarios-output");
 
             // Call 3 times - expect 3 separate output blobs
             for (int i = 0; i < 3; i++)
@@ -285,6 +342,29 @@ namespace Microsoft.Azure.WebJobs.Script.Tests
                 int blobInt = BitConverter.ToInt32(contents, 0);
                 Assert.True(blobInt >= 0 && blobInt <= 3);
             }
+        }
+
+        [Fact]
+        public async Task Scenario_OutputBindingContainsFunctions()
+        {
+            var container = await GetEmptyContainer("scenarios-output");
+
+            JObject input = new JObject
+                {
+                    { "scenario", "bindingContainsFunctions" },
+                    { "container", "scenarios-output" },
+                };
+            Dictionary<string, object> arguments = new Dictionary<string, object>
+            {
+                { "input", input.ToString() }
+            };
+            await Fixture.Host.CallAsync("Scenarios", arguments);
+
+            var blobs = container.ListBlobs().Cast<CloudBlockBlob>().ToArray();
+            Assert.Equal(1, blobs.Length);
+
+            var blobString = await blobs[0].DownloadTextAsync();
+            Assert.Equal("{\"nested\":{},\"array\":[{}],\"value\":\"value\"}", blobString);
         }
 
         [Fact]
@@ -321,18 +401,22 @@ namespace Microsoft.Azure.WebJobs.Script.Tests
             Assert.True(logs[1].Contains("Exports: IsObject=true, Count=1"));
         }
 
-        [Fact]
-        public async Task HttpTrigger_Get()
+        [Theory]
+        [InlineData("httptrigger")]
+        [InlineData("httptriggershared")]
+        public async Task HttpTrigger_Get(string functionName)
         {
             HttpRequestMessage request = new HttpRequestMessage
             {
-                RequestUri = new Uri(string.Format("http://localhost/api/httptrigger?name=Mathew%20Charles&location=Seattle")),
+                RequestUri = new Uri($"http://localhost/api/{functionName}?name=Mathew%20Charles&location=Seattle"),
                 Method = HttpMethod.Get,
             };
             request.SetConfiguration(Fixture.RequestConfiguration);
             request.Headers.Add("test-header", "Test Request Header");
             string userAgent = "Mozilla/5.0 (Windows NT 10.0; WOW64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/54.0.2840.71 Safari/537.36";
             request.Headers.Add("user-agent", userAgent);
+            string accept = "text/html, application/xhtml+xml, application/xml; q=0.9, */*; q=0.8";
+            request.Headers.Add("accept", accept);
             string customHeader = "foo,bar,baz";
             request.Headers.Add("custom-1", customHeader);
 
@@ -363,7 +447,55 @@ namespace Microsoft.Azure.WebJobs.Script.Tests
             JObject reqHeaders = (JObject)resultObject["reqHeaders"];
             Assert.Equal("Test Request Header", reqHeaders["test-header"]);
             Assert.Equal(userAgent, reqHeaders["user-agent"]);
+            Assert.Equal(accept, reqHeaders["accept"]);
             Assert.Equal(customHeader, reqHeaders["custom-1"]);
+        }
+
+        [Fact]
+        public async Task HttpTriggerToBlob()
+        {
+            var request = new HttpRequestMessage
+            {
+                RequestUri = new Uri($"http://localhost/api/HttpTriggerToBlob?suffix=TestSuffix"),
+                Method = HttpMethod.Post,
+            };
+            request.SetConfiguration(Fixture.RequestConfiguration);
+            request.Headers.Add("Prefix", "TestPrefix");
+            request.Headers.Add("value", "TestValue");
+
+            var id = Guid.NewGuid().ToString();
+            var metadata = new JObject()
+            {
+                { "m1", "AAA" },
+                { "m2", "BBB" }
+            };
+            var input = new JObject()
+            {
+                { "id", id },
+                { "value", "TestInput" },
+                { "metadata", metadata }
+            };
+            request.Content = new StringContent(input.ToString());
+            request.Content.Headers.ContentType = new MediaTypeHeaderValue("application/json");
+
+            var arguments = new Dictionary<string, object>
+            {
+                { "req", request }
+            };
+            await Fixture.Host.CallAsync("HttpTriggerToBlob", arguments);
+
+            HttpResponseMessage response = (HttpResponseMessage)request.Properties[ScriptConstants.AzureFunctionsHttpResponseKey];
+            Assert.Equal(HttpStatusCode.OK, response.StatusCode);
+
+            string body = await response.Content.ReadAsStringAsync();
+            string expectedValue = $"TestInput{id}TestValue";
+            Assert.Equal(expectedValue, body);
+
+            // verify blob was written
+            string blobName = $"TestPrefix-{id}-TestSuffix-BBB";
+            var outBlob = Fixture.TestOutputContainer.GetBlockBlobReference(blobName);
+            string result = await TestHelpers.WaitForBlobAndGetStringAsync(outBlob);
+            Assert.Equal(expectedValue, result);
         }
 
         [Theory]
@@ -570,6 +702,48 @@ namespace Microsoft.Azure.WebJobs.Script.Tests
         }
 
         [Fact]
+        public async Task HttpTrigger_Scenarios_ResBinding()
+        {
+            HttpRequestMessage request = new HttpRequestMessage
+            {
+                RequestUri = new Uri(string.Format("http://localhost/api/httptrigger-scenarios")),
+                Method = HttpMethod.Post,
+            };
+            request.SetConfiguration(new HttpConfiguration());
+            request.Headers.Add("scenario", "resbinding");
+            Dictionary<string, object> arguments = new Dictionary<string, object>
+            {
+                { "req", request }
+            };
+            await Fixture.Host.CallAsync("HttpTrigger-Scenarios", arguments);
+
+            HttpResponseMessage response = (HttpResponseMessage)request.Properties[ScriptConstants.AzureFunctionsHttpResponseKey];
+            Assert.Equal(HttpStatusCode.Accepted, response.StatusCode);
+            Assert.Equal("test", await response.Content.ReadAsAsync<string>());
+        }
+
+        [Fact]
+        public async Task HttpTrigger_Scenarios_NullBody()
+        {
+            HttpRequestMessage request = new HttpRequestMessage
+            {
+                RequestUri = new Uri(string.Format("http://localhost/api/httptrigger-scenarios")),
+                Method = HttpMethod.Post,
+            };
+            request.SetConfiguration(new HttpConfiguration());
+            request.Headers.Add("scenario", "nullbody");
+            Dictionary<string, object> arguments = new Dictionary<string, object>
+            {
+                { "req", request }
+            };
+            await Fixture.Host.CallAsync("HttpTrigger-Scenarios", arguments);
+
+            HttpResponseMessage response = (HttpResponseMessage)request.Properties[ScriptConstants.AzureFunctionsHttpResponseKey];
+            Assert.Equal(HttpStatusCode.NoContent, response.StatusCode);
+            Assert.Null(response.Content);
+        }
+
+        [Fact]
         public async Task HttpTrigger_Scenarios_ScalarReturn_InBody()
         {
             HttpRequestMessage request = new HttpRequestMessage
@@ -645,6 +819,7 @@ namespace Microsoft.Azure.WebJobs.Script.Tests
                 Content = new StringContent(testData)
             };
             request.SetConfiguration(new HttpConfiguration());
+            request.Content.Headers.ContentType = new MediaTypeHeaderValue("text/plain");
 
             Dictionary<string, object> arguments = new Dictionary<string, object>
             {
@@ -661,6 +836,7 @@ namespace Microsoft.Azure.WebJobs.Script.Tests
             Assert.Equal(testData, (string)resultObject["reqBody"]);
             Assert.Equal("string", (string)resultObject["reqRawBodyType"]);
             Assert.Equal(testData, (string)resultObject["reqRawBody"]);
+            Assert.Equal("text/plain", resultObject["reqHeaders"]["content-type"]);
         }
 
         [Fact]
@@ -968,7 +1144,7 @@ namespace Microsoft.Azure.WebJobs.Script.Tests
             // See https://github.com/tjanczuk/edge/issues/325.
             // This ensures the workaround is working
 
-            // we're not going to await this call as it may hang if there is 
+            // we're not going to await this call as it may hang if there is
             // a regression, instead, monitor for IsCompleted below.
             JObject input = new JObject
             {
@@ -1053,35 +1229,28 @@ namespace Microsoft.Azure.WebJobs.Script.Tests
         }
 
         [Fact]
-        public async Task PromiseApi_ResolveAfterDone()
+        public async Task ExecutionContext_IsProvided()
         {
             TestHelpers.ClearFunctionLogs("Scenarios");
 
             JObject input = new JObject
             {
-                { "scenario", "promiseApiDone" }
+                { "scenario", "functionExecutionContext" }
             };
 
-            var arguments = new Dictionary<string, object>()
-            {
-                { "input", input.ToString() }
-            };
-
-            // call multiple times to reduce flakiness (function can exit before Promise.resolve executes)
-            for (int i = 0; i < 10; i++)
-            {
-                await Task.WhenAny(Fixture.Host.CallAsync("Scenarios", arguments), Task.Delay(2000));
-
-                var logs = await TestHelpers.GetFunctionLogsAsync("Scenarios");
-                if (logs.Any(p => p.Contains("Error: Choose either to return a promise or call 'done'.  Do not use both in your script.")))
+            Task t = Fixture.Host.CallAsync("Scenarios",
+                new Dictionary<string, object>()
                 {
-                    // short circuit if we find log
-                    return;
-                }
-            }
+                    { "input", input.ToString() }
+                });
 
-            // this should never be reached
-            Assert.True(false, "There was no log found for duplicate calls to done");
+            Task result = await Task.WhenAny(t, Task.Delay(5000));
+
+            var logs = await TestHelpers.GetFunctionLogsAsync("Scenarios");
+
+            Assert.Same(t, result);
+            Assert.True(logs.Any(l => l.Contains("FunctionName:Scenarios")));
+            Assert.True(logs.Any(l => l.Contains($"FunctionDirectory:{Path.Combine(Fixture.Host.ScriptConfig.RootScriptPath, "Scenarios")}")));
         }
 
         [Fact]
@@ -1114,6 +1283,7 @@ namespace Microsoft.Azure.WebJobs.Script.Tests
             Assert.Equal(0, array[0]);
             Assert.Equal(1, array[1]);
         }
+
         public class TestFixture : EndToEndTestFixture
         {
             public TestFixture() : base(@"TestScripts\Node", "node")

@@ -44,6 +44,21 @@
                     "description": "Defines the default route prefix that applies to all routes. Use an empty string to remove the prefix.",
                     "type": "string",
                     "default": "api"
+                },
+                "maxConcurrentRequests": {
+                    "description": "Defines the the maximum number of http functions that will execute in parallel.",
+                    "type": "integer",
+                    "default": -1
+                },
+                "maxOutstandingRequests": {
+                    "description": "Defines the maximum number of oustanding requests that will be held at any given time.",
+                    "type": "integer",
+                    "default": -1
+                },
+                "dynamicThrottlesEnabled": {
+                    "description": "Indicates whether dynamic host counter checks should be enabled.",
+                    "type": "boolean",
+                    "default": false
                 }
             }
         },
@@ -111,8 +126,15 @@
                 "prefetchCount": {
                     "description": "The default PrefetchCount that will be used by the underlying MessageReceiver.",
                     "type": "integer"
+                },
+
+                "autoRenewTimeout": {
+                    "description": "The maximum duration within which the Service Bus message lock will be renewed automatically.",
+                    "type": "string",
+                    "pattern": "^\\d\\d:\\d\\d:\\d\\d$",
+                    "default": "00:05:00"
                 }
-            }
+            }          
         },
 
         "eventHub": {
@@ -129,6 +151,12 @@
                 "prefetchCount": {
                     "description": "The default PrefetchCount that will be used by the underlying EventProcessorHost.",
                     "type": "integer"
+                },
+
+                "batchCheckpointFrequency": {
+                    "description": "The number of batches to process before creating an EventHub cursor checkpoint",
+                    "type": "integer",
+                    "default": 1
                 }
             }
         },

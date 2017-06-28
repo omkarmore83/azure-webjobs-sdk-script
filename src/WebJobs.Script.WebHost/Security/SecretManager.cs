@@ -4,26 +4,24 @@
 using System;
 using System.Collections.Concurrent;
 using System.Collections.Generic;
-using System.Diagnostics;
-using System.Globalization;
 using System.IO;
 using System.Linq;
 using System.Security.Cryptography;
+using System.Threading.Tasks;
 using Microsoft.Azure.WebJobs.Host;
 using Microsoft.Azure.WebJobs.Script.Config;
-using Microsoft.Azure.WebJobs.Script.IO;
 using Microsoft.Azure.WebJobs.Script.WebHost.Properties;
+using Microsoft.Extensions.Logging;
 
 namespace Microsoft.Azure.WebJobs.Script.WebHost
 {
     public class SecretManager : IDisposable, ISecretManager
     {
-        private readonly string _secretsPath;
         private readonly ConcurrentDictionary<string, Dictionary<string, string>> _secretsMap = new ConcurrentDictionary<string, Dictionary<string, string>>();
         private readonly IKeyValueConverterFactory _keyValueConverterFactory;
-        private readonly AutoRecoveringFileSystemWatcher _fileWatcher;
-        private readonly string _hostSecretsPath;
         private readonly TraceWriter _traceWriter;
+        private readonly ILogger _logger;
+        private readonly ISecretsRepository _repository;
         private HostSecretsInfo _hostSecrets;
 
         // for testing
@@ -31,29 +29,24 @@ namespace Microsoft.Azure.WebJobs.Script.WebHost
         {
         }
 
-        public SecretManager(ScriptSettingsManager settingsManager, string secretsPath, TraceWriter traceWriter, bool createHostSecretsIfMissing = false)
-            : this(secretsPath, new DefaultKeyValueConverterFactory(settingsManager), traceWriter, createHostSecretsIfMissing)
+        public SecretManager(ScriptSettingsManager settingsManager, ISecretsRepository repository, TraceWriter traceWriter, ILoggerFactory loggerFactory, bool createHostSecretsIfMissing = false)
+            : this(repository, new DefaultKeyValueConverterFactory(settingsManager), traceWriter, loggerFactory, createHostSecretsIfMissing)
         {
         }
 
-        public SecretManager(string secretsPath, IKeyValueConverterFactory keyValueConverterFactory, TraceWriter traceWriter, bool createHostSecretsIfMissing = false)
+        public SecretManager(ISecretsRepository repository, IKeyValueConverterFactory keyValueConverterFactory, TraceWriter traceWriter, ILoggerFactory loggerFactory, bool createHostSecretsIfMissing = false)
         {
-            _traceWriter = traceWriter.WithSource(ScriptConstants.TraceSourceSecretManagement);
-            _secretsPath = secretsPath;
-            _hostSecretsPath = Path.Combine(_secretsPath, ScriptConstants.HostMetadataFileName);
+            _repository = repository;
             _keyValueConverterFactory = keyValueConverterFactory;
-
-            Directory.CreateDirectory(_secretsPath);
-
-            _fileWatcher = new AutoRecoveringFileSystemWatcher(_secretsPath, "*.json");
-
-            _fileWatcher.Changed += OnChanged;
+            _traceWriter = traceWriter;
+            _repository.SecretsChanged += OnSecretsChanged;
+            _logger = loggerFactory?.CreateLogger(ScriptConstants.LogCategoryHostGeneral);
 
             if (createHostSecretsIfMissing)
             {
                 // The SecretManager implementation of GetHostSecrets will
                 // create a host secret if one is not present.
-                GetHostSecrets();
+                GetHostSecretsAsync().GetAwaiter().GetResult();
             }
         }
 
@@ -67,21 +60,22 @@ namespace Microsoft.Azure.WebJobs.Script.WebHost
         {
             if (disposing)
             {
-                _fileWatcher?.Dispose();
+                (_repository as IDisposable)?.Dispose();
             }
         }
 
-        public virtual HostSecretsInfo GetHostSecrets()
+        public async virtual Task<HostSecretsInfo> GetHostSecretsAsync()
         {
             if (_hostSecrets == null)
             {
-                HostSecrets hostSecrets;
+                HostSecrets hostSecrets = await LoadSecretsAsync<HostSecrets>();
 
-                if (!TryLoadSecrets(_hostSecretsPath, out hostSecrets))
+                if (hostSecrets == null)
                 {
                     _traceWriter.Verbose(Resources.TraceHostSecretGeneration);
+                    _logger?.LogDebug(Resources.TraceHostSecretGeneration);
                     hostSecrets = GenerateHostSecrets();
-                    PersistSecrets(hostSecrets, _hostSecretsPath);
+                    await PersistSecretsAsync(hostSecrets);
                 }
 
                 // Host secrets will be in the original persisted state at this point (e.g. encrypted),
@@ -93,20 +87,22 @@ namespace Microsoft.Azure.WebJobs.Script.WebHost
                 if (hostSecrets.HasStaleKeys)
                 {
                     _traceWriter.Verbose(Resources.TraceStaleHostSecretRefresh);
-                    RefreshSecrets(hostSecrets, _hostSecretsPath);
+                    _logger?.LogDebug(Resources.TraceStaleHostSecretRefresh);
+                    await RefreshSecretsAsync(hostSecrets);
                 }
 
                 _hostSecrets = new HostSecretsInfo
                 {
                     MasterKey = hostSecrets.MasterKey.Value,
-                    FunctionKeys = hostSecrets.FunctionKeys.ToDictionary(s => s.Name, s => s.Value)
+                    FunctionKeys = hostSecrets.FunctionKeys.ToDictionary(s => s.Name, s => s.Value),
+                    SystemKeys = hostSecrets.SystemKeys.ToDictionary(s => s.Name, s => s.Value)
                 };
             }
 
             return _hostSecrets;
         }
 
-        public virtual IDictionary<string, string> GetFunctionSecrets(string functionName, bool merged = false)
+        public async virtual Task<IDictionary<string, string>> GetFunctionSecretsAsync(string functionName, bool merged = false)
         {
             if (string.IsNullOrEmpty(functionName))
             {
@@ -114,14 +110,17 @@ namespace Microsoft.Azure.WebJobs.Script.WebHost
             }
 
             functionName = functionName.ToLowerInvariant();
+            Dictionary<string, string> functionSecrets;
+            _secretsMap.TryGetValue(functionName, out functionSecrets);
 
-            var functionSecrets = _secretsMap.GetOrAdd(functionName, n =>
+            if (functionSecrets == null)
             {
-                FunctionSecrets secrets;
-                string secretsFilePath = GetFunctionSecretsFilePath(functionName);
-                if (!TryLoadFunctionSecrets(functionName, out secrets, secretsFilePath))
+                FunctionSecrets secrets = await LoadFunctionSecretsAsync(functionName);
+                if (secrets == null)
                 {
-                    _traceWriter.VerboseFormat(Resources.TraceFunctionSecretGeneration, functionName);
+                    string message = string.Format(Resources.TraceFunctionSecretGeneration, functionName);
+                    _traceWriter.Verbose(message);
+                    _logger?.LogDebug(message);
                     secrets = new FunctionSecrets
                     {
                         Keys = new List<Key>
@@ -130,7 +129,7 @@ namespace Microsoft.Azure.WebJobs.Script.WebHost
                         }
                     };
 
-                    PersistSecrets(secrets, secretsFilePath);
+                    await PersistSecretsAsync(secrets, functionName);
                 }
 
                 // Read all secrets, which will run the keys through the appropriate readers
@@ -138,18 +137,23 @@ namespace Microsoft.Azure.WebJobs.Script.WebHost
 
                 if (secrets.HasStaleKeys)
                 {
-                    _traceWriter.VerboseFormat(Resources.TraceStaleFunctionSecretRefresh, functionName);
-                    RefreshSecrets(secrets, secretsFilePath);
+                    string message = string.Format(Resources.TraceStaleFunctionSecretRefresh, functionName);
+                    _traceWriter.Verbose(message);
+                    _logger?.LogDebug(message);
+                    await RefreshSecretsAsync(secrets, functionName);
                 }
 
-                return secrets.Keys.ToDictionary(s => s.Name, s => s.Value);
-            });
+                Dictionary<string, string> result = secrets.Keys.ToDictionary(s => s.Name, s => s.Value);
+
+                functionSecrets = _secretsMap.AddOrUpdate(functionName, result, (n, r) => result);
+            }
 
             if (merged)
             {
                 // If merged is true, we combine function specific keys with host level function keys,
                 // prioritizing function specific keys
-                Dictionary<string, string> hostFunctionSecrets = GetHostSecrets().FunctionKeys;
+                HostSecretsInfo hostSecrets = await GetHostSecretsAsync();
+                Dictionary<string, string> hostFunctionSecrets = hostSecrets.FunctionKeys;
 
                 functionSecrets = functionSecrets.Union(hostFunctionSecrets.Where(s => !functionSecrets.ContainsKey(s.Key)))
                     .ToDictionary(kv => kv.Key, kv => kv.Value);
@@ -158,36 +162,38 @@ namespace Microsoft.Azure.WebJobs.Script.WebHost
             return functionSecrets;
         }
 
-        public KeyOperationResult AddOrUpdateFunctionSecret(string secretName, string secret, string functionName = null)
+        public async Task<KeyOperationResult> AddOrUpdateFunctionSecretAsync(string secretName, string secret, string keyScope, ScriptSecretsType secretsType)
         {
-            string secretsFilePath;
-            ScriptSecretsType secretsType;
             Func<ScriptSecrets> secretsFactory = null;
 
-            if (functionName != null)
+            if (secretsType == ScriptSecretsType.Function)
             {
-                secretsFilePath = GetFunctionSecretsFilePath(functionName);
-                secretsType = ScriptSecretsType.Function;
                 secretsFactory = () => new FunctionSecrets(new List<Key>());
             }
-            else
+            else if (secretsType == ScriptSecretsType.Host)
             {
-                secretsFilePath = _hostSecretsPath;
                 secretsType = ScriptSecretsType.Host;
                 secretsFactory = GenerateHostSecrets;
             }
+            else
+            {
+                throw new NotSupportedException($"Secrets type {secretsType.ToString("G")} not supported.");
+            }
 
-            KeyOperationResult result = AddOrUpdateSecret(secretsType, secretsFilePath, secretName, secret, secretsFactory);
+            KeyOperationResult result = await AddOrUpdateSecretAsync(secretsType, keyScope, secretName, secret, secretsFactory);
 
-            _traceWriter.InfoFormat(Resources.TraceAddOrUpdateFunctionSecret, secretsType, secretName, functionName ?? "host", result.Result);
+            string message = string.Format(Resources.TraceAddOrUpdateFunctionSecret, secretsType, secretName, keyScope ?? "host", result.Result);
+            _traceWriter.Info(message);
+            _logger?.LogInformation(message);
 
             return result;
         }
 
-        public KeyOperationResult SetMasterKey(string value = null)
+        public async Task<KeyOperationResult> SetMasterKeyAsync(string value = null)
         {
-            HostSecrets secrets;
-            if (!TryLoadSecrets(_hostSecretsPath, out secrets))
+            HostSecrets secrets = await LoadSecretsAsync<HostSecrets>();
+
+            if (secrets == null)
             {
                 secrets = GenerateHostSecrets();
             }
@@ -210,63 +216,62 @@ namespace Microsoft.Azure.WebJobs.Script.WebHost
             // Creates a key with the new master key (which will be encrypted, if required)
             secrets.MasterKey = CreateKey(ScriptConstants.DefaultMasterKeyName, masterKey);
 
-            PersistSecrets(secrets, _hostSecretsPath);
+            await PersistSecretsAsync(secrets);
 
-            _traceWriter.InfoFormat(Resources.TraceMasterKeyCreatedOrUpdated, result);
+            string message = string.Format(Resources.TraceMasterKeyCreatedOrUpdated, result);
+            _traceWriter.Info(message);
+            _logger?.LogInformation(message);
 
             return new KeyOperationResult(masterKey, result);
         }
 
-        public bool DeleteSecret(string secretName, string functionName = null)
+        public async Task<bool> DeleteSecretAsync(string secretName, string keyScope, ScriptSecretsType secretsType)
         {
-            string secretsFilePath = _hostSecretsPath;
-            ScriptSecretsType secretsType = ScriptSecretsType.Host;
-
-            if (functionName != null)
+            bool deleted = await ModifyFunctionSecretAsync(secretsType, keyScope, secretName, (secrets, key) =>
             {
-                secretsFilePath = GetFunctionSecretsFilePath(functionName);
-                secretsType = ScriptSecretsType.Function;
-            }
-
-            bool deleted = ModifyFunctionSecret(secretsType, secretsFilePath, secretName, (secrets, key) =>
-            {
-                secrets?.RemoveKey(key);
+                secrets?.RemoveKey(key, keyScope);
                 return secrets;
             });
 
             if (deleted)
             {
                 string target = secretsType == ScriptSecretsType.Function
-                    ? $"Function ('{functionName}')"
-                    : "Host";
-                _traceWriter.InfoFormat(Resources.TraceSecretDeleted, target, secretName);
+                    ? $"Function ('{keyScope}')"
+                    : $"Host (scope: '{keyScope}')";
+
+                string message = string.Format(Resources.TraceSecretDeleted, target, secretName);
+                _traceWriter.Info(message);
+                _logger?.LogInformation(message);
             }
 
             return deleted;
         }
 
-        private KeyOperationResult AddOrUpdateSecret(ScriptSecretsType secretsType, string secretFilePath, string secretName, string secret, Func<ScriptSecrets> secretsFactory)
+        private async Task<KeyOperationResult> AddOrUpdateSecretAsync(ScriptSecretsType secretsType, string keyScope,
+            string secretName, string secret, Func<ScriptSecrets> secretsFactory)
         {
             OperationResult result = OperationResult.NotFound;
 
             secret = secret ?? GenerateSecret();
 
-            ModifyFunctionSecrets(secretsType, secretFilePath, secrets =>
+            await ModifyFunctionSecretsAsync(secretsType, keyScope, secrets =>
             {
-                Key key = secrets.GetFunctionKey(secretName);
+                Key key = secrets.GetFunctionKey(secretName, keyScope);
+
+                var createAndUpdateKey = new Action<OperationResult>((o) =>
+                {
+                    var newKey = CreateKey(secretName, secret);
+                    secrets.AddKey(newKey, keyScope);
+                    result = o;
+                });
 
                 if (key == null)
                 {
-                    key = new Key(secretName, secret);
-                    secrets.AddKey(key);
-                    result = OperationResult.Created;
+                    createAndUpdateKey(OperationResult.Created);
                 }
-                else if (secrets.RemoveKey(key))
+                else if (secrets.RemoveKey(key, keyScope))
                 {
-                    key = CreateKey(secretName, secret);
-                    secrets.AddKey(key);
-
-                    result = OperationResult.Updated;
+                    createAndUpdateKey(OperationResult.Updated);
                 }
 
                 return secrets;
@@ -275,13 +280,13 @@ namespace Microsoft.Azure.WebJobs.Script.WebHost
             return new KeyOperationResult(secret, result);
         }
 
-        private static bool ModifyFunctionSecret(ScriptSecretsType secretsType, string secretFilePath, string secretName, Func<ScriptSecrets, Key, ScriptSecrets> keyChangeHandler, Func<ScriptSecrets> secretFactory = null)
+        private async Task<bool> ModifyFunctionSecretAsync(ScriptSecretsType secretsType, string keyScope, string secretName, Func<ScriptSecrets, Key, ScriptSecrets> keyChangeHandler, Func<ScriptSecrets> secretFactory = null)
         {
             bool secretFound = false;
 
-            ModifyFunctionSecrets(secretsType, secretFilePath, secrets =>
+            await ModifyFunctionSecretsAsync(secretsType, keyScope, secrets =>
             {
-                Key key = secrets?.GetFunctionKey(secretName);
+                Key key = secrets?.GetFunctionKey(secretName, keyScope);
 
                 if (key != null)
                 {
@@ -296,11 +301,11 @@ namespace Microsoft.Azure.WebJobs.Script.WebHost
             return secretFound;
         }
 
-        private static void ModifyFunctionSecrets(ScriptSecretsType secretsType, string secretFilePath, Func<ScriptSecrets, ScriptSecrets> changeHandler, Func<ScriptSecrets> secretFactory)
+        private async Task ModifyFunctionSecretsAsync(ScriptSecretsType secretsType, string keyScope, Func<ScriptSecrets, ScriptSecrets> changeHandler, Func<ScriptSecrets> secretFactory)
         {
-            ScriptSecrets currentSecrets;
+            ScriptSecrets currentSecrets = await LoadSecretsAsync(secretsType, keyScope);
 
-            if (!TryLoadSecrets(secretsType, secretFilePath, out currentSecrets))
+            if (currentSecrets == null)
             {
                 currentSecrets = secretFactory?.Invoke();
             }
@@ -309,48 +314,42 @@ namespace Microsoft.Azure.WebJobs.Script.WebHost
 
             if (newSecrets != null)
             {
-                PersistSecrets(newSecrets, secretFilePath);
+                await PersistSecretsAsync(newSecrets, keyScope);
             }
         }
 
-        private bool TryLoadFunctionSecrets(string functionName, out FunctionSecrets secrets, string filePath = null)
-        {
-            secrets = null;
-            string secretsFilePath = filePath ?? GetFunctionSecretsFilePath(functionName);
+        private Task<FunctionSecrets> LoadFunctionSecretsAsync(string functionName)
+            => LoadSecretsAsync<FunctionSecrets>(functionName);
 
-            return TryLoadSecrets(secretsFilePath, out secrets);
+        private Task<ScriptSecrets> LoadSecretsAsync(ScriptSecretsType secretsType, string keyScope)
+            => LoadSecretsAsync(secretsType, keyScope, s => ScriptSecretSerializer.DeserializeSecrets(secretsType, s));
+
+        private async Task<T> LoadSecretsAsync<T>(string keyScope = null) where T : ScriptSecrets
+        {
+            ScriptSecretsType type = GetSecretsType<T>();
+
+            var result = await LoadSecretsAsync(type, keyScope, ScriptSecretSerializer.DeserializeSecrets<T>);
+
+            return result as T;
         }
 
-        private static bool TryLoadSecrets(ScriptSecretsType secretsType, string filePath, out ScriptSecrets secrets)
-            => TryLoadSecrets(filePath, s => ScriptSecretSerializer.DeserializeSecrets(secretsType, s), out secrets);
-
-        private static bool TryLoadSecrets<T>(string filePath, out T secrets) where T : ScriptSecrets
+        private async Task<ScriptSecrets> LoadSecretsAsync(ScriptSecretsType type, string keyScope, Func<string, ScriptSecrets> deserializationHandler)
         {
-            ScriptSecrets deserializedSecrets;
-            TryLoadSecrets(filePath, ScriptSecretSerializer.DeserializeSecrets<T>, out deserializedSecrets);
-            secrets = deserializedSecrets as T;
+            string secretsJson = await _repository.ReadAsync(type, keyScope).ConfigureAwait(false);
 
-            return secrets != null;
-        }
-
-        private static bool TryLoadSecrets(string filePath, Func<string, ScriptSecrets> deserializationHandler, out ScriptSecrets secrets)
-        {
-            secrets = null;
-
-            if (File.Exists(filePath))
+            if (!string.IsNullOrEmpty(secretsJson))
             {
-                // load the secrets file
-                string secretsJson = File.ReadAllText(filePath);
-                secrets = deserializationHandler(secretsJson);
+                return deserializationHandler(secretsJson);
             }
 
-            return secrets != null;
+            return null;
         }
 
-        private string GetFunctionSecretsFilePath(string functionName)
+        private static ScriptSecretsType GetSecretsType<T>() where T : ScriptSecrets
         {
-            string secretFileName = string.Format(CultureInfo.InvariantCulture, "{0}.json", functionName);
-            return Path.Combine(_secretsPath, secretFileName);
+            return typeof(HostSecrets).IsAssignableFrom(typeof(T))
+                ? ScriptSecretsType.Host
+                : ScriptSecretsType.Function;
         }
 
         private HostSecrets GenerateHostSecrets()
@@ -361,21 +360,22 @@ namespace Microsoft.Azure.WebJobs.Script.WebHost
                 FunctionKeys = new List<Key>
                 {
                     GenerateKey(ScriptConstants.DefaultFunctionKeyName)
-                }
+                },
+                SystemKeys = new List<Key>()
             };
         }
 
-        private void RefreshSecrets<T>(T secrets, string secretsFilePath) where T : ScriptSecrets
+        private Task RefreshSecretsAsync<T>(T secrets, string keyScope = null) where T : ScriptSecrets
         {
             var refreshedSecrets = secrets.Refresh(_keyValueConverterFactory);
 
-            PersistSecrets(refreshedSecrets, secretsFilePath);
+            return PersistSecretsAsync(refreshedSecrets, keyScope);
         }
 
-        private static void PersistSecrets<T>(T secrets, string secretsFilePath) where T : ScriptSecrets
+        private Task PersistSecretsAsync<T>(T secrets, string keyScope = null) where T : ScriptSecrets
         {
             string secretsContent = ScriptSecretSerializer.SerializeSecrets<T>(secrets);
-            File.WriteAllText(secretsFilePath, secretsContent);
+            return _repository.WriteAsync(secrets.SecretsType, keyScope, secretsContent);
         }
 
         private HostSecrets ReadHostSecrets(HostSecrets hostSecrets)
@@ -383,60 +383,9 @@ namespace Microsoft.Azure.WebJobs.Script.WebHost
             return new HostSecrets
             {
                 MasterKey = _keyValueConverterFactory.ReadKey(hostSecrets.MasterKey),
-                FunctionKeys = hostSecrets.FunctionKeys.Select(k => _keyValueConverterFactory.ReadKey(k)).ToList()
+                FunctionKeys = hostSecrets.FunctionKeys.Select(k => _keyValueConverterFactory.ReadKey(k)).ToList(),
+                SystemKeys = hostSecrets.SystemKeys?.Select(k => _keyValueConverterFactory.ReadKey(k)).ToList() ?? new List<Key>()
             };
-        }
-
-        public void PurgeOldFiles(string rootScriptPath, TraceWriter traceWriter)
-        {
-            try
-            {
-                if (!Directory.Exists(rootScriptPath))
-                {
-                    return;
-                }
-
-                // Create a lookup of all potential functions (whether they're valid or not)
-                // It is important that we determine functions based on the presence of a folder,
-                // not whether we've identified a valid function from that folder. This ensures
-                // that we don't delete logs/secrets for functions that transition into/out of
-                // invalid unparsable states.
-                var functionLookup = Directory.EnumerateDirectories(rootScriptPath).ToLookup(p => Path.GetFileName(p), StringComparer.OrdinalIgnoreCase);
-
-                var secretsDirectory = new DirectoryInfo(_secretsPath);
-                if (!Directory.Exists(_secretsPath))
-                {
-                    return;
-                }
-
-                foreach (var secretFile in secretsDirectory.GetFiles("*.json"))
-                {
-                    if (string.Compare(secretFile.Name, ScriptConstants.HostMetadataFileName, StringComparison.OrdinalIgnoreCase) == 0)
-                    {
-                        // the secrets directory contains the host secrets file in addition
-                        // to function secret files
-                        continue;
-                    }
-
-                    string fileName = Path.GetFileNameWithoutExtension(secretFile.Name);
-                    if (!functionLookup.Contains(fileName))
-                    {
-                        try
-                        {
-                            secretFile.Delete();
-                        }
-                        catch
-                        {
-                            // Purge is best effort
-                        }
-                    }
-                }
-            }
-            catch (Exception ex)
-            {
-                // Purge is best effort
-                traceWriter.Error("An error occurred while purging secret files", ex);
-            }
         }
 
         private Key GenerateKey(string name = null)
@@ -466,20 +415,36 @@ namespace Microsoft.Azure.WebJobs.Script.WebHost
             }
         }
 
-        private void OnChanged(object sender, FileSystemEventArgs e)
+        private void OnSecretsChanged(object sender, SecretsChangedEventArgs e)
         {
             // clear the cached secrets if they exist
             // they'll be reloaded on demand next time
-            if (string.Compare(Path.GetFileName(e.FullPath), ScriptConstants.HostMetadataFileName, StringComparison.OrdinalIgnoreCase) == 0)
+            if (e.SecretsType == ScriptSecretsType.Host)
             {
                 _hostSecrets = null;
             }
             else
             {
                 Dictionary<string, string> secrets;
-                string name = Path.GetFileNameWithoutExtension(e.FullPath).ToLowerInvariant();
-                _secretsMap.TryRemove(name, out secrets);
+                _secretsMap.TryRemove(e.Name, out secrets);
             }
+        }
+
+        public async Task PurgeOldSecretsAsync(string rootScriptPath, TraceWriter traceWriter, ILogger logger)
+        {
+            if (!Directory.Exists(rootScriptPath))
+            {
+                return;
+            }
+
+            // Create a lookup of all potential functions (whether they're valid or not)
+            // It is important that we determine functions based on the presence of a folder,
+            // not whether we've identified a valid function from that folder. This ensures
+            // that we don't delete logs/secrets for functions that transition into/out of
+            // invalid unparsable states.
+            var currentFunctions = Directory.EnumerateDirectories(rootScriptPath).Select(p => Path.GetFileName(p)).ToList();
+
+            await _repository.PurgeOldSecretsAsync(currentFunctions, traceWriter, logger);
         }
     }
 }

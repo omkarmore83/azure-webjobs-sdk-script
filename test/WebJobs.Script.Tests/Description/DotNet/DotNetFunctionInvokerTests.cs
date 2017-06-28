@@ -12,11 +12,13 @@ using System.Threading.Tasks;
 using Microsoft.Azure.WebJobs.Script.Binding;
 using Microsoft.Azure.WebJobs.Script.Description;
 using Microsoft.Azure.WebJobs.Script.Diagnostics;
+using Microsoft.Azure.WebJobs.Script.Eventing;
 using Microsoft.Azure.WebJobs.Script.Tests.Properties;
 using Microsoft.CodeAnalysis;
 using Microsoft.CodeAnalysis.Scripting;
 using Moq;
 using Newtonsoft.Json.Linq;
+using WebJobs.Script.Tests;
 using Xunit;
 
 namespace Microsoft.Azure.WebJobs.Script.Tests
@@ -35,10 +37,11 @@ namespace Microsoft.Azure.WebJobs.Script.Tests
             RunDependencies dependencies = CreateDependencies();
             dependencies.Compilation.Setup(c => c.GetEntryPointSignature(It.IsAny<IFunctionEntryPointResolver>()))
                 .Throws(exception);
-            dependencies.Compilation.Setup(c => c.EmitAndLoad(It.IsAny<CancellationToken>()))
+            dependencies.Compilation.Setup(c => c.Emit(It.IsAny<CancellationToken>()))
                 .Returns(typeof(object).Assembly);
 
-            string rootFunctionsFolder = Path.Combine(Path.GetTempPath(), Guid.NewGuid().ToString());
+            string functionName = Guid.NewGuid().ToString();
+            string rootFunctionsFolder = Path.Combine(Path.GetTempPath(), functionName);
             Directory.CreateDirectory(rootFunctionsFolder);
 
             // Create a dummy file to represent our function
@@ -48,7 +51,8 @@ namespace Microsoft.Azure.WebJobs.Script.Tests
             var metadata = new FunctionMetadata
             {
                 ScriptFile = filePath,
-                Name = Guid.NewGuid().ToString(),
+                FunctionDirectory = Path.GetDirectoryName(filePath),
+                Name = functionName,
                 ScriptType = ScriptType.CSharp
             };
 
@@ -56,10 +60,11 @@ namespace Microsoft.Azure.WebJobs.Script.Tests
 
             var invoker = new DotNetFunctionInvoker(dependencies.Host.Object, metadata, new Collection<Script.Binding.FunctionBinding>(),
                 new Collection<FunctionBinding>(), dependencies.EntrypointResolver.Object, new FunctionAssemblyLoader(string.Empty),
-                dependencies.CompilationServiceFactory.Object, dependencies.TraceWriterFactory.Object);
+                dependencies.CompilationServiceFactory.Object);
 
-            // Update the file to trigger a reload
-            File.WriteAllText(filePath, string.Empty);
+            // Send file change notification to trigger a reload
+            var fileEventArgs = new FileSystemEventArgs(WatcherChangeTypes.Changed, Path.GetTempPath(), Path.Combine(Path.GetFileName(rootFunctionsFolder), Path.GetFileName(filePath)));
+            dependencies.Host.Object.EventManager.Publish(new FileEvent(EventSources.ScriptFiles, fileEventArgs));
 
             await TestHelpers.Await(() =>
             {
@@ -81,7 +86,7 @@ namespace Microsoft.Azure.WebJobs.Script.Tests
         [Fact]
         public async Task Compilation_WithMissingBindingArguments_LogsAF004Warning()
         {
-            // Create the compilation exception we expect to throw during the reload           
+            // Create the compilation exception we expect to throw during the reload
             string rootFunctionsFolder = Path.Combine(Path.GetTempPath(), Guid.NewGuid().ToString());
             Directory.CreateDirectory(rootFunctionsFolder);
 
@@ -95,6 +100,7 @@ namespace Microsoft.Azure.WebJobs.Script.Tests
             var metadata = new FunctionMetadata
             {
                 ScriptFile = filePath,
+                FunctionDirectory = Path.GetDirectoryName(filePath),
                 Name = Guid.NewGuid().ToString(),
                 ScriptType = ScriptType.CSharp
             };
@@ -105,7 +111,7 @@ namespace Microsoft.Azure.WebJobs.Script.Tests
 
             var invoker = new DotNetFunctionInvoker(dependencies.Host.Object, metadata, new Collection<FunctionBinding>(),
                 new Collection<FunctionBinding> { testBinding.Object }, new FunctionEntryPointResolver(), new FunctionAssemblyLoader(string.Empty),
-                new DotNetCompilationServiceFactory(NullTraceWriter.Instance), dependencies.TraceWriterFactory.Object);
+                new DotNetCompilationServiceFactory(NullTraceWriter.Instance, null));
 
             await invoker.GetFunctionTargetAsync();
 
@@ -116,7 +122,7 @@ namespace Microsoft.Azure.WebJobs.Script.Tests
         [Fact]
         public async Task Compilation_OnSecondaryHost_SuppressesLogs()
         {
-            // Create the compilation exception we expect to throw during the reload           
+            // Create the compilation exception we expect to throw during the reload
             string rootFunctionsFolder = Path.Combine(Path.GetTempPath(), Guid.NewGuid().ToString());
             Directory.CreateDirectory(rootFunctionsFolder);
 
@@ -133,6 +139,7 @@ namespace Microsoft.Azure.WebJobs.Script.Tests
             var metadata = new FunctionMetadata
             {
                 ScriptFile = filePath,
+                FunctionDirectory = Path.GetDirectoryName(filePath),
                 Name = Guid.NewGuid().ToString(),
                 ScriptType = ScriptType.CSharp
             };
@@ -143,7 +150,7 @@ namespace Microsoft.Azure.WebJobs.Script.Tests
 
             var invoker = new DotNetFunctionInvoker(dependencies.Host.Object, metadata, new Collection<FunctionBinding>(),
                 new Collection<FunctionBinding> { testBinding.Object }, new FunctionEntryPointResolver(), new FunctionAssemblyLoader(string.Empty),
-                new DotNetCompilationServiceFactory(NullTraceWriter.Instance), dependencies.TraceWriterFactory.Object);
+                new DotNetCompilationServiceFactory(NullTraceWriter.Instance, null));
 
             await invoker.GetFunctionTargetAsync();
 
@@ -185,7 +192,53 @@ namespace Microsoft.Azure.WebJobs.Script.Tests
             Assert.Equal(0, diagnostics.Count());
         }
 
-        private RunDependencies CreateDependencies(TraceLevel traceLevel = TraceLevel.Info)
+        [Theory]
+        [InlineData(false, true, true)]
+        [InlineData(false, false, false)]
+        [InlineData(true, true, false)]
+        public async Task RestorePackagesAsync_WithUpdatedReferences_TriggersShutdown(bool initialInstall, bool referencesChanged, bool shutdownExpected)
+        {
+            using (var tempDirectory = new TempDirectory())
+            {
+                var environmentMock = new Mock<IScriptHostEnvironment>();
+
+                // Create the invoker dependencies and setup the appropriate method to throw the exception
+                RunDependencies dependencies = CreateDependencies(environment: environmentMock.Object);
+
+                // Create a dummy file to represent our function
+                string filePath = Path.Combine(tempDirectory.Path, Guid.NewGuid().ToString() + ".csx");
+                File.WriteAllText(filePath, Resources.TestFunctionWithMissingBindingArgumentsCode);
+
+                var metadata = new FunctionMetadata
+                {
+                    ScriptFile = filePath,
+                    Name = Guid.NewGuid().ToString(),
+                    ScriptType = ScriptType.CSharp,
+                };
+
+                metadata.Bindings.Add(new BindingMetadata { Type = "TestTrigger", Direction = BindingDirection.In });
+
+                var metadataResolver = new Mock<IFunctionMetadataResolver>();
+                metadataResolver.Setup(r => r.RestorePackagesAsync())
+                    .ReturnsAsync(new PackageRestoreResult { IsInitialInstall = initialInstall, ReferencesChanged = referencesChanged });
+
+                var testBinding = new Mock<FunctionBinding>(null, new BindingMetadata() { Name = "TestBinding", Type = "blob" }, FileAccess.Write);
+
+                var invoker = new DotNetFunctionInvoker(dependencies.Host.Object, metadata, new Collection<FunctionBinding>(),
+                  new Collection<FunctionBinding> { testBinding.Object }, new FunctionEntryPointResolver(), new FunctionAssemblyLoader(string.Empty),
+                  new DotNetCompilationServiceFactory(NullTraceWriter.Instance, null), metadataResolver.Object);
+
+                await invoker.RestorePackagesAsync(true);
+
+                // Delay the check as the shutdown call is debounced
+                // and won't be made immediately
+                await Task.Delay(1000);
+
+                environmentMock.Verify(e => e.Shutdown(), Times.Exactly(shutdownExpected ? 1 : 0));
+            }
+        }
+
+        private RunDependencies CreateDependencies(TraceLevel traceLevel = TraceLevel.Info, IScriptHostEnvironment environment = null)
         {
             var dependencies = new RunDependencies();
 
@@ -200,29 +253,31 @@ namespace Microsoft.Azure.WebJobs.Script.Tests
             };
 
             scriptHostConfiguration.HostConfig.Tracing.ConsoleLevel = System.Diagnostics.TraceLevel.Verbose;
+            var eventManager = new ScriptEventManager();
+            var host = new Mock<ScriptHost>(environment ?? new NullScriptHostEnvironment(), eventManager, scriptHostConfiguration, null);
 
-            var host = new Mock<ScriptHost>(scriptHostConfiguration);
+            var traceWriterFactory = new Mock<IFunctionTraceWriterFactory>();
+            traceWriterFactory.Setup(f => f.Create(It.IsAny<string>()))
+                .Returns(functionTraceWriter);
+
             host.SetupGet(h => h.IsPrimary).Returns(true);
+            host.SetupGet(h => h.FunctionTraceWriterFactory).Returns(traceWriterFactory.Object);
 
             var entrypointResolver = new Mock<IFunctionEntryPointResolver>();
 
-            var compilation = new Mock<ICompilation>();
+            var compilation = new Mock<IDotNetCompilation>();
             compilation.Setup(c => c.GetDiagnostics())
                 .Returns(ImmutableArray<Diagnostic>.Empty);
 
-            var compilationService = new Mock<ICompilationService>();
+            var compilationService = new Mock<ICompilationService<IDotNetCompilation>>();
             compilationService.Setup(s => s.SupportedFileTypes)
                 .Returns(() => new[] { ".csx" });
-            compilationService.Setup(s => s.GetFunctionCompilation(It.IsAny<FunctionMetadata>()))
-                .Returns(compilation.Object);
+            compilationService.Setup(s => s.GetFunctionCompilationAsync(It.IsAny<FunctionMetadata>()))
+                .ReturnsAsync(compilation.Object);
 
-            var compilationServiceFactory = new Mock<ICompilationServiceFactory>();
+            var compilationServiceFactory = new Mock<ICompilationServiceFactory<ICompilationService<IDotNetCompilation>, IFunctionMetadataResolver>>();
             compilationServiceFactory.Setup(f => f.CreateService(ScriptType.CSharp, It.IsAny<IFunctionMetadataResolver>()))
                 .Returns(compilationService.Object);
-
-            var traceWriterFactory = new Mock<ITraceWriterFactory>();
-            traceWriterFactory.Setup(f => f.Create())
-                .Returns(functionTraceWriter);
 
             var metricsLogger = new MetricsLogger();
             scriptHostConfiguration.HostConfig.AddService<IMetricsLogger>(metricsLogger);
@@ -242,11 +297,17 @@ namespace Microsoft.Azure.WebJobs.Script.Tests
         private class RunDependencies
         {
             public Mock<ScriptHost> Host { get; set; }
+
             public Mock<IFunctionEntryPointResolver> EntrypointResolver { get; set; }
-            public Mock<ICompilation> Compilation { get; set; }
-            public Mock<ICompilationService> CompilationService { get; set; }
-            public Mock<ICompilationServiceFactory> CompilationServiceFactory { get; set; }
-            public Mock<ITraceWriterFactory> TraceWriterFactory { get; set; }
+
+            public Mock<IDotNetCompilation> Compilation { get; set; }
+
+            public Mock<ICompilationService<IDotNetCompilation>> CompilationService { get; set; }
+
+            public Mock<ICompilationServiceFactory<ICompilationService<IDotNetCompilation>, IFunctionMetadataResolver>> CompilationServiceFactory { get; set; }
+
+            public Mock<IFunctionTraceWriterFactory> TraceWriterFactory { get; set; }
+
             public TestTraceWriter TraceWriter { get; set; }
         }
     }

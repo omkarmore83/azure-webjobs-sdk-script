@@ -8,16 +8,17 @@ namespace Microsoft.Azure.WebJobs.Script.WebHost.Models
 {
     public class HostStatus
     {
-        public HostStatus()
-        {
-            Version = ScriptHost.Version;
-        }
-
         /// <summary>
         /// Gets or sets the host id.
         /// </summary>
         [JsonProperty(PropertyName = "id", DefaultValueHandling = DefaultValueHandling.Ignore)]
         public string Id { get; set; }
+
+        /// <summary>
+        /// Gets or sets the current status of the host.
+        /// </summary>
+        [JsonProperty(PropertyName = "state", DefaultValueHandling = DefaultValueHandling.Ignore)]
+        public string State { get; set; }
 
         /// <summary>
         /// Gets or sets the host version.
@@ -30,5 +31,11 @@ namespace Microsoft.Azure.WebJobs.Script.WebHost.Models
         /// </summary>
         [JsonProperty(PropertyName = "errors", DefaultValueHandling = DefaultValueHandling.Ignore)]
         public Collection<string> Errors { get; set; }
+
+        /// <summary>
+        /// Gets or sets a the <see cref="LoadStatus"/>.
+        /// </summary>
+        [JsonProperty(PropertyName = "load", DefaultValueHandling = DefaultValueHandling.Ignore)]
+        public LoadStatus Load { get; set; }
     }
 }

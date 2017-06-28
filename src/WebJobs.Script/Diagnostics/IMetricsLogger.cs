@@ -4,7 +4,7 @@
 namespace Microsoft.Azure.WebJobs.Script.Diagnostics
 {
     /// <summary>
-    /// Defines an interface for emitting metric events from the 
+    /// Defines an interface for emitting metric events from the
     /// script runtime for later aggregation and reporting.
     /// </summary>
     public interface IMetricsLogger
@@ -13,8 +13,9 @@ namespace Microsoft.Azure.WebJobs.Script.Diagnostics
         /// Begins an event.
         /// </summary>
         /// <param name="eventName">The event name.</param>
+        /// <param name="functionName">Optional function name for function specific events.</param>
         /// <returns>A handle to the event that was started.</returns>
-        object BeginEvent(string eventName);
+        object BeginEvent(string eventName, string functionName = null);
 
         /// <summary>
         /// Begins an event.
@@ -44,6 +45,7 @@ namespace Microsoft.Azure.WebJobs.Script.Diagnostics
         /// Raises an event.
         /// </summary>
         /// <param name="eventName">The event name.</param>
-        void LogEvent(string eventName);
+        /// <param name="functionName">Optional function name for function specific events.</param>
+        void LogEvent(string eventName, string functionName = null);
     }
 }

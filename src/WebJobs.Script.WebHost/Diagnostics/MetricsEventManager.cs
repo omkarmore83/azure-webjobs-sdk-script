@@ -16,6 +16,9 @@ namespace Microsoft.Azure.WebJobs.Script.WebHost.Diagnostics
 {
     public class MetricsEventManager : IDisposable
     {
+        // Default time between flushes in seconds (every 30 seconds)
+        private const int DefaultFlushIntervalMS = 30 * 1000;
+
         private static FunctionActivityTracker instance = null;
         private readonly IEventGenerator _eventGenerator;
         private readonly int _functionActivityFlushIntervalSeconds;
@@ -25,13 +28,10 @@ namespace Microsoft.Azure.WebJobs.Script.WebHost.Diagnostics
         private static string subscriptionId;
         private bool _disposed;
 
-        // Default time between flushes in seconds (every 30 seconds)
-        private const int DefaultFlushIntervalMS = 30 * 1000;
-
         public MetricsEventManager(ScriptSettingsManager settingsManager, IEventGenerator generator, int functionActivityFlushIntervalSeconds, int metricsFlushIntervalMS = DefaultFlushIntervalMS)
         {
             // we read these in the ctor (not static ctor) since it can change on the fly
-            appName = GetNormalizedString(settingsManager.AzureWebsiteDefaultSubdomain);
+            appName = GetNormalizedString(settingsManager.AzureWebsiteUniqueSlotName);
             subscriptionId = Utility.GetSubscriptionId() ?? string.Empty;
 
             _eventGenerator = generator;
@@ -47,7 +47,7 @@ namespace Microsoft.Azure.WebJobs.Script.WebHost.Diagnostics
         /// </summary>
         public ConcurrentDictionary<string, SystemMetricEvent> QueuedEvents { get; }
 
-        public object BeginEvent(string eventName)
+        public object BeginEvent(string eventName, string functionName = null)
         {
             if (string.IsNullOrEmpty(eventName))
             {
@@ -56,6 +56,7 @@ namespace Microsoft.Azure.WebJobs.Script.WebHost.Diagnostics
 
             return new SystemMetricEvent
             {
+                FunctionName = functionName,
                 EventName = eventName.ToLowerInvariant(),
                 Timestamp = DateTime.UtcNow
             };
@@ -74,13 +75,19 @@ namespace Microsoft.Azure.WebJobs.Script.WebHost.Diagnostics
                 evt.Duration = DateTime.UtcNow - evt.Timestamp;
                 long latencyMS = (long)evt.Duration.TotalMilliseconds;
 
-                QueuedEvents.AddOrUpdate(evt.EventName,
+                // event aggregation is based on this key
+                // for each unique key, there will be only 1
+                // queued event that we aggregate into
+                string key = GetAggregateKey(evt.EventName, evt.FunctionName);
+
+                QueuedEvents.AddOrUpdate(key,
                     (name) =>
                     {
                         // create the default event that will be added
-                        // if an event isn't already queued for this event name
+                        // if an event isn't already queued for this key
                         return new SystemMetricEvent
                         {
+                            FunctionName = evt.FunctionName,
                             EventName = evt.EventName,
                             Minimum = latencyMS,
                             Maximum = latencyMS,
@@ -103,20 +110,22 @@ namespace Microsoft.Azure.WebJobs.Script.WebHost.Diagnostics
             }
         }
 
-        public void LogEvent(string eventName)
+        public void LogEvent(string eventName, string functionName = null)
         {
             if (string.IsNullOrEmpty(eventName))
             {
                 throw new ArgumentNullException(nameof(eventName));
             }
 
-            QueuedEvents.AddOrUpdate(eventName,
+            string key = GetAggregateKey(eventName, functionName);
+            QueuedEvents.AddOrUpdate(key,
                 (name) =>
                 {
                     // create the default event that will be added
-                    // if an event isn't already queued for this event name
+                    // if an event isn't already queued for this key
                     return new SystemMetricEvent
                     {
+                        FunctionName = functionName,
                         EventName = eventName.ToLowerInvariant(),
                         Count = 1
                     };
@@ -187,6 +196,18 @@ namespace Microsoft.Azure.WebJobs.Script.WebHost.Diagnostics
             }
         }
 
+        /// <summary>
+        /// Constructs the aggregate key used to group events. When metric events are
+        /// added for later aggregation on flush, they'll be grouped by this key.
+        /// </summary>
+        internal static string GetAggregateKey(string eventName, string functionName = null)
+        {
+            string key = string.IsNullOrEmpty(functionName) ?
+                eventName : $"{eventName}_{functionName}";
+
+            return key.ToLowerInvariant();
+        }
+
         private static string SerializeBindings(IEnumerable<BindingMetadata> bindings)
         {
             if (bindings != null)
@@ -247,6 +268,7 @@ namespace Microsoft.Azure.WebJobs.Script.WebHost.Diagnostics
                 _eventGenerator.LogFunctionMetricEvent(
                     subscriptionId,
                     appName,
+                    metricEvent.FunctionName ?? string.Empty,
                     metricEvent.EventName.ToLowerInvariant(),
                     metricEvent.Average,
                     metricEvent.Minimum,
@@ -254,6 +276,32 @@ namespace Microsoft.Azure.WebJobs.Script.WebHost.Diagnostics
                     metricEvent.Count,
                     metricEvent.Timestamp);
             }
+        }
+
+        protected virtual void Dispose(bool disposing)
+        {
+            if (!_disposed)
+            {
+                if (disposing)
+                {
+                    // flush any outstanding events
+                    TimerFlush(state: null);
+
+                    if (_metricsFlushTimer != null)
+                    {
+                        _metricsFlushTimer.Dispose();
+                    }
+                }
+
+                _disposed = true;
+            }
+        }
+
+        // This code added to correctly implement the disposable pattern.
+        public void Dispose()
+        {
+            Dispose(true);
+            GC.SuppressFinalize(this);
         }
 
         private class FunctionActivityTracker : IDisposable
@@ -265,6 +313,7 @@ namespace Microsoft.Azure.WebJobs.Script.WebHost.Diagnostics
             private CancellationTokenSource _etwTaskCancellationSource = new CancellationTokenSource();
             private ConcurrentQueue<FunctionMetrics> _functionMetricsQueue = new ConcurrentQueue<FunctionMetrics>();
             private Dictionary<string, RunningFunctionInfo> _runningFunctions = new Dictionary<string, RunningFunctionInfo>();
+            private bool _disposed = false;
 
             internal FunctionActivityTracker(IEventGenerator generator, int functionActivityFlushInterval)
             {
@@ -314,9 +363,13 @@ namespace Microsoft.Azure.WebJobs.Script.WebHost.Diagnostics
 
             protected virtual void Dispose(bool disposing)
             {
-                if (disposing)
+                if (!_disposed)
                 {
-                    _etwTaskCancellationSource.Dispose();
+                    if (disposing)
+                    {
+                        _etwTaskCancellationSource.Dispose();
+                    }
+                    _disposed = true;
                 }
             }
 
@@ -425,14 +478,14 @@ namespace Microsoft.Azure.WebJobs.Script.WebHost.Diagnostics
                 List<FunctionMetrics> metricsEventsList = GetMetricsQueueSnapshot();
 
                 var aggregatedEventsPerFunction = from item in metricsEventsList
-                                                  group item by item.FunctionName into FunctionGroups
+                                                  group item by item.FunctionName into functionGroups
                                                   select new
                                                   {
-                                                      FunctionName = FunctionGroups.Key,
-                                                      StartedCount = Convert.ToUInt64(FunctionGroups.Count(x => x.ExecutionStage == ExecutionStage.Started)),
-                                                      FailedCount = Convert.ToUInt64(FunctionGroups.Count(x => x.ExecutionStage == ExecutionStage.Failed)),
-                                                      SucceededCount = Convert.ToUInt64(FunctionGroups.Count(x => x.ExecutionStage == ExecutionStage.Succeeded)),
-                                                      TotalExectionTimeInMs = Convert.ToUInt64(FunctionGroups.Sum(x => Convert.ToDecimal(x.ExecutionTimeInMS)))
+                                                      FunctionName = functionGroups.Key,
+                                                      StartedCount = Convert.ToUInt64(functionGroups.Count(x => x.ExecutionStage == ExecutionStage.Started)),
+                                                      FailedCount = Convert.ToUInt64(functionGroups.Count(x => x.ExecutionStage == ExecutionStage.Failed)),
+                                                      SucceededCount = Convert.ToUInt64(functionGroups.Count(x => x.ExecutionStage == ExecutionStage.Succeeded)),
+                                                      TotalExectionTimeInMs = Convert.ToUInt64(functionGroups.Sum(x => Convert.ToDecimal(x.ExecutionTimeInMS)))
                                                   };
 
                 foreach (var functionEvent in aggregatedEventsPerFunction)
@@ -470,38 +523,17 @@ namespace Microsoft.Azure.WebJobs.Script.WebHost.Diagnostics
                 }
 
                 public string Name { get; private set; }
+
                 public Guid InvocationId { get; private set; }
+
                 public DateTime StartTime { get; private set; }
+
                 public ExecutionStage ExecutionStage { get; set; }
+
                 public DateTime EndTime { get; set; }
+
                 public bool Success { get; set; }
             }
-        }
-
-        protected virtual void Dispose(bool disposing)
-        {
-            if (!_disposed)
-            {
-                if (disposing)
-                {
-                    // flush any outstanding events
-                    TimerFlush(state: null);
-
-                    if (_metricsFlushTimer != null)
-                    {
-                        _metricsFlushTimer.Dispose();
-                    }
-                }
-
-                _disposed = true;
-            }
-        }
-
-        // This code added to correctly implement the disposable pattern.
-        public void Dispose()
-        {
-            Dispose(true);
-            GC.SuppressFinalize(this);
         }
     }
 }

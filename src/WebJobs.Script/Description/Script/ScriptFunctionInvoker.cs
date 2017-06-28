@@ -9,13 +9,11 @@ using System.Globalization;
 using System.IO;
 using System.Linq;
 using System.Threading.Tasks;
-using Microsoft.Azure.WebJobs.Host;
 using Microsoft.Azure.WebJobs.Script.Binding;
 
 namespace Microsoft.Azure.WebJobs.Script.Description
 {
     // TODO: make this internal
-    [CLSCompliant(false)]
     public class ScriptFunctionInvoker : ScriptFunctionInvokerBase
     {
         private const string BashPathEnvironmentKey = "AzureWebJobs_BashPath";
@@ -28,8 +26,8 @@ namespace Microsoft.Azure.WebJobs.Script.Description
         private readonly Collection<FunctionBinding> _outputBindings;
 
         internal ScriptFunctionInvoker(string scriptFilePath, ScriptHost host, FunctionMetadata functionMetadata,
-            Collection<FunctionBinding> inputBindings, Collection<FunctionBinding> outputBindings, ITraceWriterFactory traceWriterFactory = null)
-            : base(host, functionMetadata, traceWriterFactory)
+            Collection<FunctionBinding> inputBindings, Collection<FunctionBinding> outputBindings)
+            : base(host, functionMetadata)
         {
             _scriptFilePath = scriptFilePath;
             _host = host;
@@ -86,12 +84,15 @@ namespace Microsoft.Azure.WebJobs.Script.Description
 
             await ProcessInputBindingsAsync(convertedInput, functionInstanceOutputPath, context.Binder, _inputBindings, _outputBindings, bindingData, environmentVariables);
 
+            SetExecutionContextVariables(context.ExecutionContext, environmentVariables);
+
             Process process = CreateProcess(path, workingDirectory, arguments, environmentVariables);
             var userTraceWriter = CreateUserTraceWriter(context.TraceWriter);
             process.OutputDataReceived += (s, e) =>
             {
                 if (e.Data != null)
                 {
+                    // the user's TraceWriter will automatically log to ILogger as well
                     userTraceWriter.Info(e.Data);
                 }
             };

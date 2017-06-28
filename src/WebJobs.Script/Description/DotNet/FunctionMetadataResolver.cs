@@ -9,12 +9,12 @@ using System.Collections.ObjectModel;
 using System.IO;
 using System.Linq;
 using System.Reflection;
-using System.Security.Policy;
 using System.Threading.Tasks;
 using Microsoft.Azure.WebJobs.Host;
 using Microsoft.Azure.WebJobs.Script.Extensibility;
 using Microsoft.CodeAnalysis;
 using Microsoft.CodeAnalysis.Scripting;
+using Microsoft.Extensions.Logging;
 
 namespace Microsoft.Azure.WebJobs.Script.Description
 {
@@ -22,14 +22,14 @@ namespace Microsoft.Azure.WebJobs.Script.Description
     /// Provides runtime and compile-time assembly/metadata resolution for a given assembly, loading privately deployed
     /// or package assemblies.
     /// </summary>
-    [CLSCompliant(false)]
     public sealed class FunctionMetadataResolver : MetadataReferenceResolver, IFunctionMetadataResolver
     {
         private readonly string _privateAssembliesPath;
+        private readonly string _scriptFileDirectory;
         private readonly string[] _assemblyExtensions = new[] { ".exe", ".dll" };
         private readonly string _id = Guid.NewGuid().ToString();
-        private readonly FunctionMetadata _functionMetadata;
         private readonly TraceWriter _traceWriter;
+        private readonly ILoggerFactory _loggerFactory;
         private readonly ConcurrentDictionary<string, string> _externalReferences = new ConcurrentDictionary<string, string>();
         private readonly ExtensionSharedAssemblyProvider _extensionSharedAssemblyProvider;
 
@@ -46,6 +46,7 @@ namespace Microsoft.Azure.WebJobs.Script.Description
                 "System.Runtime",
                 "System.Threading.Tasks",
                 "Microsoft.CSharp",
+                typeof(ILoggerFactory).Assembly.Location, /*Microsoft.Extensions.Logging.Abstractions*/
                 typeof(IAsyncCollector<>).Assembly.Location, /*Microsoft.Azure.WebJobs*/
                 typeof(JobHost).Assembly.Location, /*Microsoft.Azure.WebJobs.Host*/
                 typeof(CoreJobHostConfigurationExtensions).Assembly.Location, /*Microsoft.Azure.WebJobs.Extensions*/
@@ -70,17 +71,19 @@ namespace Microsoft.Azure.WebJobs.Script.Description
                 "System.Net.Http",
                 "System.Threading.Tasks",
                 "Microsoft.Azure.WebJobs",
-                "Microsoft.Azure.WebJobs.Host"
+                "Microsoft.Azure.WebJobs.Host",
+                "Microsoft.Extensions.Logging"
             };
 
-        public FunctionMetadataResolver(FunctionMetadata metadata, ICollection<ScriptBindingProvider> bindingProviders, TraceWriter traceWriter)
+        public FunctionMetadataResolver(string scriptFileDirectory, ICollection<ScriptBindingProvider> bindingProviders, TraceWriter traceWriter, ILoggerFactory loggerFactory)
         {
-            _functionMetadata = metadata;
+            _scriptFileDirectory = scriptFileDirectory;
             _traceWriter = traceWriter;
-            _packageAssemblyResolver = new PackageAssemblyResolver(metadata);
-            _privateAssembliesPath = GetBinDirectory(metadata);
+            _packageAssemblyResolver = new PackageAssemblyResolver(scriptFileDirectory);
+            _privateAssembliesPath = GetBinDirectory(scriptFileDirectory);
             _scriptResolver = ScriptMetadataResolver.Default.WithSearchPaths(_privateAssembliesPath);
             _extensionSharedAssemblyProvider = new ExtensionSharedAssemblyProvider(bindingProviders);
+            _loggerFactory = loggerFactory;
         }
 
         public ScriptOptions CreateScriptOptions()
@@ -91,18 +94,17 @@ namespace Microsoft.Azure.WebJobs.Script.Description
                     .WithMetadataResolver(this)
                     .WithReferences(GetCompilationReferences())
                     .WithImports(DefaultNamespaceImports)
-                    .WithSourceResolver(new SourceFileResolver(ImmutableArray<string>.Empty, Path.GetDirectoryName(_functionMetadata.ScriptFile)));
+                    .WithSourceResolver(new SourceFileResolver(ImmutableArray<string>.Empty, _scriptFileDirectory));
         }
 
         /// <summary>
         /// Gets the private 'bin' path for a given script.
         /// </summary>
-        /// <param name="metadata">The function metadata.</param>
+        /// <param name="baseDirectory">The path to the base directory.</param>
         /// <returns>The path to the function's private assembly folder</returns>
-        private static string GetBinDirectory(FunctionMetadata metadata)
+        private static string GetBinDirectory(string baseDirectory)
         {
-            string functionDirectory = Path.GetDirectoryName(metadata.ScriptFile);
-            return Path.Combine(Path.GetFullPath(functionDirectory), DotNetConstants.PrivateAssembliesFolderName);
+            return Path.Combine(Path.GetFullPath(baseDirectory), DotNetConstants.PrivateAssembliesFolderName);
         }
 
         public override bool Equals(object other)
@@ -189,10 +191,10 @@ namespace Microsoft.Azure.WebJobs.Script.Description
                 bool externalReference = false;
                 string basePath = _privateAssembliesPath;
 
-                // If this is a relative assembly reference, use the function directory as the base probing path
+                // If this is a relative assembly reference, use the function script directory as the base probing path
                 if (reference.IndexOfAny(new[] { Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar }) > -1)
                 {
-                    basePath = Path.GetDirectoryName(_functionMetadata.ScriptFile);
+                    basePath = _scriptFileDirectory;
                     externalReference = true;
                 }
 
@@ -232,6 +234,10 @@ namespace Microsoft.Azure.WebJobs.Script.Description
                 // Use LoadFile here to load into the correct context
                 assembly = Assembly.LoadFile(assemblyPath);
             }
+            else if (_extensionSharedAssemblyProvider.TryResolveAssembly(assemblyName, out assembly))
+            {
+                return assembly;
+            }
 
             return assembly;
         }
@@ -255,13 +261,15 @@ namespace Microsoft.Azure.WebJobs.Script.Description
             return _assemblyExtensions.Select(ext => Path.Combine(_privateAssembliesPath, assemblyName.Name + ext));
         }
 
-        public async Task RestorePackagesAsync()
+        public async Task<PackageRestoreResult> RestorePackagesAsync()
         {
-            var packageManager = new PackageManager(_functionMetadata, _traceWriter);
-            await packageManager.RestorePackagesAsync();
+            var packageManager = new PackageManager(_scriptFileDirectory, _traceWriter, _loggerFactory);
+            PackageRestoreResult result = await packageManager.RestorePackagesAsync();
 
             // Reload the resolver
-            _packageAssemblyResolver = new PackageAssemblyResolver(_functionMetadata);
+            _packageAssemblyResolver = new PackageAssemblyResolver(_scriptFileDirectory);
+
+            return result;
         }
 
         public bool RequiresPackageRestore(FunctionMetadata metadata)

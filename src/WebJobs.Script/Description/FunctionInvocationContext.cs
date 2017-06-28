@@ -3,15 +3,18 @@
 
 using System;
 using Microsoft.Azure.WebJobs.Host;
-using Microsoft.Azure.WebJobs.Host.Bindings.Runtime;
+using Microsoft.Extensions.Logging;
 
 namespace Microsoft.Azure.WebJobs.Script.Description
 {
-    [CLSCompliant(false)]
     public class FunctionInvocationContext
     {
         public ExecutionContext ExecutionContext { get; set; }
+
         public Binder Binder { get; set; }
+
         public TraceWriter TraceWriter { get; set; }
+
+        public ILogger Logger { get; set; }
     }
 }

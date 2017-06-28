@@ -8,12 +8,15 @@ using System.Linq;
 using System.Reflection;
 using System.Text.RegularExpressions;
 using Microsoft.Azure.WebJobs.Host;
+using Microsoft.Azure.WebJobs.Host.Loggers;
+using Microsoft.Azure.WebJobs.Logging;
+using Microsoft.Extensions.Logging;
 
 namespace Microsoft.Azure.WebJobs.Script.Description
 {
     /// <summary>
-    /// Manages runtime assembly resolution for managed code functions, 
-    /// loading assemblies from their respective <see cref="FunctionAssemblyLoadContext"/>. 
+    /// Manages runtime assembly resolution for managed code functions,
+    /// loading assemblies from their respective <see cref="FunctionAssemblyLoadContext"/>.
     /// </summary>
     public class FunctionAssemblyLoader : IDisposable
     {
@@ -65,7 +68,7 @@ namespace Microsoft.Azure.WebJobs.Script.Description
                 {
                     string assemblyName = ((AppDomain)sender).ApplyPolicy(args.Name);
 
-                    // If after applying the current policy, we now have a different target assembly name, attempt to load that 
+                    // If after applying the current policy, we now have a different target assembly name, attempt to load that
                     // assembly
                     if (string.Compare(assemblyName, args.Name) != 0)
                     {
@@ -77,8 +80,10 @@ namespace Microsoft.Azure.WebJobs.Script.Description
             {
                 if (context != null)
                 {
-                    context.TraceWriter.Warning(string.Format(CultureInfo.InvariantCulture,
-                        "Exception during runtime resolution of assembly '{0}': '{1}'", args.Name, e.ToString()));
+                    string message = string.Format(CultureInfo.InvariantCulture,
+                        "Exception during runtime resolution of assembly '{0}': '{1}'", args.Name, e.ToString());
+                    context.TraceWriter.Warning(message);
+                    context.Logger?.LogWarning(message);
                 }
             }
 
@@ -86,15 +91,17 @@ namespace Microsoft.Azure.WebJobs.Script.Description
             // log the failure as this is usually caused by missing private assemblies.
             if (context != null && result == null)
             {
-                context.TraceWriter.Warning(string.Format(CultureInfo.InvariantCulture,
-                    "Unable to find assembly '{0}'. Are you missing a private assembly file?", args.Name));
+                string message = string.Format(CultureInfo.InvariantCulture,
+                    "Unable to find assembly '{0}'. Are you missing a private assembly file?", args.Name);
+                context.TraceWriter.Warning(message);
+                context.Logger?.LogWarning(message);
             }
 
             return result;
         }
 
-        [CLSCompliant(false)]
-        public FunctionAssemblyLoadContext CreateOrUpdateContext(FunctionMetadata metadata, Assembly functionAssembly, IFunctionMetadataResolver metadataResolver, TraceWriter traceWriter)
+        public FunctionAssemblyLoadContext CreateOrUpdateContext(FunctionMetadata metadata, Assembly functionAssembly, IFunctionMetadataResolver metadataResolver,
+            TraceWriter traceWriter, ILoggerFactory loggerFactory)
         {
             if (metadata == null)
             {
@@ -113,7 +120,8 @@ namespace Microsoft.Azure.WebJobs.Script.Description
                 throw new ArgumentNullException("traceWriter");
             }
 
-            var context = new FunctionAssemblyLoadContext(metadata, functionAssembly, metadataResolver, traceWriter);
+            ILogger logger = loggerFactory?.CreateLogger(LogCategories.Startup);
+            var context = new FunctionAssemblyLoadContext(metadata, functionAssembly, metadataResolver, traceWriter, logger);
 
             return _functionContexts.AddOrUpdate(metadata.Name, context, (s, o) => context);
         }
@@ -137,7 +145,7 @@ namespace Microsoft.Azure.WebJobs.Script.Description
             {
                 context = GetFunctionContext(functionName);
 
-                // If the context is for a different assembly 
+                // If the context is for a different assembly
                 if (context != null && context.FunctionAssembly != requestingAssembly)
                 {
                     return null;

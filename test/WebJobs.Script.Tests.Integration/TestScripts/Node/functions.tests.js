@@ -1,10 +1,10 @@
 ﻿var expect = require('chai').expect;
 
-var config = process.argv[process.argv.length - 1]
-config = (config.indexOf('--config=') !== -1)? config.substr(9): 'Debug';
+var config = process.argv[process.argv.length - 1];
+config = config.indexOf('--config=') !== -1 ? config.substr(9): 'Debug';
 
 function testRequire(script) {
-    return require('../../bin/' + config + '/Content/Script/' + script);
+    return require('../../bin/' + config + '/azurefunctions/' + script);
 }
 
 var functions = testRequire('functions.js');
@@ -146,13 +146,18 @@ describe('http', () => {
 describe('functions', () => {
     var context = {};
     var logs = [];
+    var bindingValues = {};
     beforeEach(() => {
+        bindingValues = {};
         logs = [];
         context = {
             _inputs: [],
             bindings: {},
             log: (message) => logs.push(message),
-            bind: (val, cb) => cb && cb(val)
+            bind: (val, cb) => {
+                bindingValues = val;
+                cb && cb(val);
+            }
         };
     });
 
@@ -169,7 +174,7 @@ describe('functions', () => {
         it('runs single export', () => {
             var run = false;
             var func = functions.createFunction({
-                f: () => run = true,
+                f: () => run = true
             });
 
             func(context);
@@ -230,7 +235,7 @@ describe('functions', () => {
             var func = functions.createFunction((context) => {
                 context.done();
                 context.done();
-                expect(logs[0]).to.match(/Error: 'done' has already been called.*/);
+                expect(logs[0].msg).to.match(/Error: 'done' has already been called.*/);
             });
 
             func(context, () => {});
@@ -244,9 +249,31 @@ describe('functions', () => {
 
             func(context, () => {
                 setImmediate(() => {
-                    expect(logs[0]).to.match(/Error: Choose either to return a promise or call 'done'.*/);
+                    expect(logs[0].msg).to.match(/Error: Choose either to return a promise or call 'done'.*/);
                     done();
                 });
+            });
+        });
+
+        it('logs to respective level', (done) => {
+            var func = functions.createFunction((context) => {
+                context.log('default');
+                context.log.error('error');
+                context.log.warn('warn');
+                context.log.info('info');
+                context.log.verbose('verbose');
+                context.done();
+            });
+
+            func(context, () => {
+                expect(logs).to.eql([
+                    { lvl: 3, msg: 'default' },
+                    { lvl: 1, msg: 'error' },
+                    { lvl: 2, msg: 'warn' },
+                    { lvl: 3, msg: 'info' },
+                    { lvl: 4, msg: 'verbose' }
+                ]);
+                done();
             });
         });
 

@@ -18,15 +18,15 @@ namespace Microsoft.Azure.WebJobs.Script.Description
     internal sealed class DotNetFunctionDescriptorProvider : FunctionDescriptorProvider, IDisposable
     {
         private readonly FunctionAssemblyLoader _assemblyLoader;
-        private readonly ICompilationServiceFactory _compilationServiceFactory;
+        private readonly ICompilationServiceFactory<ICompilationService<IDotNetCompilation>, IFunctionMetadataResolver> _compilationServiceFactory;
 
         public DotNetFunctionDescriptorProvider(ScriptHost host, ScriptHostConfiguration config)
-           : this(host, config, new DotNetCompilationServiceFactory(host.TraceWriter))
+           : this(host, config, new DotNetCompilationServiceFactory(host.TraceWriter, config.HostConfig.LoggerFactory))
         {
         }
 
         public DotNetFunctionDescriptorProvider(ScriptHost host, ScriptHostConfiguration config,
-            ICompilationServiceFactory compilationServiceFactory)
+            ICompilationServiceFactory<ICompilationService<IDotNetCompilation>, IFunctionMetadataResolver> compilationServiceFactory)
             : base(host, config)
         {
             _assemblyLoader = new FunctionAssemblyLoader(config.RootScriptPath);
@@ -138,7 +138,7 @@ namespace Microsoft.Azure.WebJobs.Script.Description
                         // In the C# programming model, IsOut is set for out parameters
                         // In the F# programming model, neither IsOut nor IsIn are set for byref parameters (which are used as out parameters).
                         //   Justification for this cariation of the programming model is that declaring 'out' parameters is (deliberately)
-                        //   awkward in F#, they require opening System.Runtime.InteropServices and adding the [<Out>] attribute, and using 
+                        //   awkward in F#, they require opening System.Runtime.InteropServices and adding the [<Out>] attribute, and using
                         //   a byref parameter. In contrast declaring a byref parameter alone (neither labelled In nor Out) is simple enough.
                         if (parameter.IsOut || (functionMetadata.ScriptType == ScriptType.FSharp && parameterIsByRef && !parameter.IsIn))
                         {
@@ -196,9 +196,18 @@ namespace Microsoft.Azure.WebJobs.Script.Description
             descriptor = null;
 
             var returnBinding = bindings.SingleOrDefault(p => p.Metadata.IsReturn);
-            if (returnBinding == null || returnBinding is IResultProcessingBinding)
+            if (returnBinding == null)
             {
                 return false;
+            }
+            var resultBinding = returnBinding as IResultProcessingBinding;
+            if (resultBinding != null)
+            {
+                if (resultBinding.CanProcessResult(true))
+                {
+                    // The trigger binding (ie, httpTrigger) will handle the return.
+                    return false;
+                }
             }
 
             if (typeof(Task).IsAssignableFrom(functionReturnType))

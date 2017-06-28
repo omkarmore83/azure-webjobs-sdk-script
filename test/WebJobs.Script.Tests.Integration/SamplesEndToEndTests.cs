@@ -3,6 +3,7 @@
 
 using System;
 using System.Collections.Generic;
+using System.Diagnostics;
 using System.IO;
 using System.Linq;
 using System.Net;
@@ -17,6 +18,7 @@ using Microsoft.Azure.WebJobs.Host;
 using Microsoft.Azure.WebJobs.Script.Config;
 using Microsoft.Azure.WebJobs.Script.Tests.Properties;
 using Microsoft.Azure.WebJobs.Script.WebHost;
+using Microsoft.Azure.WebJobs.Script.WebHost.Filters;
 using Microsoft.Azure.WebJobs.Script.WebHost.Models;
 using Microsoft.ServiceBus;
 using Microsoft.ServiceBus.Messaging;
@@ -32,6 +34,8 @@ namespace Microsoft.Azure.WebJobs.Script.Tests
 {
     public class SamplesEndToEndTests : IClassFixture<SamplesEndToEndTests.TestFixture>
     {
+        internal const string MasterKey = "t8laajal0a1ajkgzoqlfv5gxr4ebhqozebw4qzdy";
+
         private readonly ScriptSettingsManager _settingsManager;
         private TestFixture _fixture;
 
@@ -56,7 +60,9 @@ namespace Microsoft.Azure.WebJobs.Script.Tests
                 {
                     { "value", ids[i] }
                 };
-                events.Add(new EventData(Encoding.UTF8.GetBytes(jo.ToString(Formatting.None))));
+                var evt = new EventData(Encoding.UTF8.GetBytes(jo.ToString(Formatting.None)));
+                evt.Properties.Add("TestIndex", i);
+                events.Add(evt);
             }
 
             string connectionString = Environment.GetEnvironmentVariable("AzureWebJobsEventHubSender");
@@ -77,7 +83,7 @@ namespace Microsoft.Azure.WebJobs.Script.Tests
             string logs = null;
             await TestHelpers.Await(() =>
             {
-                // wait for all 3 of the unique IDs send
+                // wait until all of the 3 of the unique IDs sent
                 // above have been processed
                 logs = string.Join("\r\n", TestHelpers.GetFunctionLogsAsync("EventHubTrigger", throwOnNoLogs: false).Result);
                 return ids.All(p => logs.Contains(p));
@@ -117,10 +123,11 @@ namespace Microsoft.Azure.WebJobs.Script.Tests
 
             string uri = "admin/functions/manualtrigger-csharp";
             HttpRequestMessage request = new HttpRequestMessage(HttpMethod.Post, uri);
-            request.Headers.Add("x-functions-key", "t8laajal0a1ajkgzoqlfv5gxr4ebhqozebw4qzdy");
+            request.Headers.Add(AuthorizationLevelAttribute.FunctionsKeyHeaderName, MasterKey);
             JObject input = new JObject()
             {
-                { "input", new JObject()
+                {
+                    "input", new JObject()
                     {
                         { "InId", inId },
                         { "OutId", outId }
@@ -156,10 +163,11 @@ namespace Microsoft.Azure.WebJobs.Script.Tests
 
             string uri = "admin/functions/manualtrigger";
             HttpRequestMessage request = new HttpRequestMessage(HttpMethod.Post, uri);
-            request.Headers.Add("x-functions-key", "t8laajal0a1ajkgzoqlfv5gxr4ebhqozebw4qzdy");
+            request.Headers.Add(AuthorizationLevelAttribute.FunctionsKeyHeaderName, MasterKey);
             JObject input = new JObject()
             {
-                { "input", new JObject()
+                {
+                    "input", new JObject()
                     {
                         { "inId", inId },
                         { "outId", outId }
@@ -279,11 +287,25 @@ namespace Microsoft.Azure.WebJobs.Script.Tests
         }
 
         [Fact]
+        public async Task HttpTrigger_DuplicateQueryParams_Succeeds()
+        {
+            string uri = "api/httptrigger?code=hyexydhln844f2mb7hgsup2yf8dowlb0885mbiq1&name=Mathew&name=Amy";
+            HttpRequestMessage request = new HttpRequestMessage(HttpMethod.Get, uri);
+            request.Headers.Accept.Add(new MediaTypeWithQualityHeaderValue("text/plain"));
+
+            HttpResponseMessage response = await this._fixture.HttpClient.SendAsync(request);
+            Assert.Equal(HttpStatusCode.OK, response.StatusCode);
+            string body = await response.Content.ReadAsStringAsync();
+            Assert.Equal("text/plain", response.Content.Headers.ContentType.MediaType);
+            Assert.Equal("Hello Amy", body);
+        }
+
+        [Fact]
         public async Task HttpTrigger_CustomRoute_Get_ReturnsExpectedResponse()
         {
             TestHelpers.ClearFunctionLogs("HttpTrigger-CustomRoute-Get");
 
-            var id = Guid.NewGuid().ToString();
+            var id = "4e2796ae-b865-4071-8a20-2a15cbaf856c";
             string functionKey = "82fprgh77jlbhcma3yr1zen8uv9yb0i7dwze3np2";
             string uri = $"api/node/products/electronics/{id}?code={functionKey}";
             HttpRequestMessage request = new HttpRequestMessage(HttpMethod.Get, uri);
@@ -292,7 +314,9 @@ namespace Microsoft.Azure.WebJobs.Script.Tests
             HttpResponseMessage response = await this._fixture.HttpClient.SendAsync(request);
             Assert.Equal(HttpStatusCode.OK, response.StatusCode);
             string json = await response.Content.ReadAsStringAsync();
-            var product = JObject.Parse(json);
+            JArray products = JArray.Parse(json);
+            Assert.Equal(1, products.Count);
+            var product = products[0];
             Assert.Equal("electronics", (string)product["category"]);
             Assert.Equal(id, (string)product["id"]);
 
@@ -303,8 +327,18 @@ namespace Microsoft.Azure.WebJobs.Script.Tests
             response = await this._fixture.HttpClient.SendAsync(request);
             Assert.Equal(HttpStatusCode.OK, response.StatusCode);
             json = await response.Content.ReadAsStringAsync();
-            JArray products = JArray.Parse(json);
+            products = JArray.Parse(json);
             Assert.Equal(2, products.Count);
+
+            // test optional route param (category)
+            uri = $"api/node/products?code={functionKey}";
+            request = new HttpRequestMessage(HttpMethod.Get, uri);
+            request.Headers.Accept.Add(new MediaTypeWithQualityHeaderValue("text/plain"));
+            response = await this._fixture.HttpClient.SendAsync(request);
+            Assert.Equal(HttpStatusCode.OK, response.StatusCode);
+            json = await response.Content.ReadAsStringAsync();
+            products = JArray.Parse(json);
+            Assert.Equal(3, products.Count);
 
             // test a constraint violation (invalid id)
             uri = $"api/node/products/electronics/notaguid?code={functionKey}";
@@ -409,7 +443,7 @@ namespace Microsoft.Azure.WebJobs.Script.Tests
             Assert.Equal("electronics", (string)product["Category"]);
             Assert.Equal(123, (int?)product["Id"]);
 
-            // now try again without specifying optional id parameter
+            // test optional id parameter
             uri = $"api/csharp/products/electronics?code={functionKey}";
             request = new HttpRequestMessage(HttpMethod.Get, uri);
             response = await this._fixture.HttpClient.SendAsync(request);
@@ -417,6 +451,16 @@ namespace Microsoft.Azure.WebJobs.Script.Tests
             json = await response.Content.ReadAsStringAsync();
             product = JObject.Parse(json);
             Assert.Equal("electronics", (string)product["Category"]);
+            Assert.Null((int?)product["Id"]);
+
+            // test optional category parameter
+            uri = $"api/csharp/products?code={functionKey}";
+            request = new HttpRequestMessage(HttpMethod.Get, uri);
+            response = await this._fixture.HttpClient.SendAsync(request);
+            Assert.Equal(HttpStatusCode.OK, response.StatusCode);
+            json = await response.Content.ReadAsStringAsync();
+            product = JObject.Parse(json);
+            Assert.Null((string)product["Category"]);
             Assert.Null((int?)product["Id"]);
 
             // test a constraint violation (invalid id)
@@ -600,6 +644,26 @@ namespace Microsoft.Azure.WebJobs.Script.Tests
         }
 
         [Fact]
+        public async Task GenericWebHook_Post_NamedKey_Headers_Succeeds()
+        {
+            // Authenticate using values specified via headers,
+            // rather than URI query params
+            string uri = "api/webhook-generic";
+            HttpRequestMessage request = new HttpRequestMessage(HttpMethod.Post, uri);
+            request.Headers.Add(AuthorizationLevelAttribute.FunctionsKeyHeaderName, MasterKey);
+            request.Headers.Add("x-functions-clientid", "testclient");
+            request.Content = new StringContent("{ 'value': 'Foobar' }");
+            request.Content.Headers.ContentType = new MediaTypeHeaderValue("application/json");
+
+            HttpResponseMessage response = await this._fixture.HttpClient.SendAsync(request);
+            Assert.Equal(HttpStatusCode.OK, response.StatusCode);
+            Assert.Equal("application/json", response.Content.Headers.ContentType.MediaType);
+            string body = await response.Content.ReadAsStringAsync();
+            JObject jsonObject = JObject.Parse(body);
+            Assert.Equal("Value: Foobar", jsonObject["result"]);
+        }
+
+        [Fact]
         public async Task GenericWebHook_Post_NamedKeyInHeader_Succeeds()
         {
             // Authenticate using a named key (client id)
@@ -699,6 +763,7 @@ namespace Microsoft.Azure.WebJobs.Script.Tests
 
             // verify the function output
             var logs = await TestHelpers.GetFunctionLogsAsync("QueueTrigger-Python");
+
             // strip off the timestamps from the beginning of each line
             logs = logs.Select(l => l.Split(new[] { ' ' }, 2)[1]).ToList();
             int idx = logs.IndexOf("Read 5 Table entities");
@@ -717,6 +782,7 @@ namespace Microsoft.Azure.WebJobs.Script.Tests
             // write input blob
             CloudBlobContainer inputContainer = _fixture.BlobClient.GetContainerReference("samples-batch");
             await inputContainer.CreateIfNotExistsAsync();
+
             // Processing a large number of blobs on startup can take a while,
             // so let's start with an empty container.
             TestHelpers.ClearContainer(inputContainer);
@@ -843,12 +909,13 @@ namespace Microsoft.Azure.WebJobs.Script.Tests
 
             string uri = "admin/functions/servicebustopictrigger";
             HttpRequestMessage request = new HttpRequestMessage(HttpMethod.Post, uri);
-            request.Headers.Add("x-functions-key", "t8laajal0a1ajkgzoqlfv5gxr4ebhqozebw4qzdy");
+            request.Headers.Add(AuthorizationLevelAttribute.FunctionsKeyHeaderName, MasterKey);
             string id = Guid.NewGuid().ToString();
             string value = Guid.NewGuid().ToString();
             JObject input = new JObject()
             {
-                { "input", new JObject()
+                {
+                    "input", new JObject()
                     {
                         { "id", id },
                         { "value", value }
@@ -873,11 +940,85 @@ namespace Microsoft.Azure.WebJobs.Script.Tests
         }
 
         [Fact]
-        public async Task HostStatus_Succeeds()
+        public async Task HostPing_Succeeds()
+        {
+            string uri = "admin/host/ping";
+            HttpRequestMessage request = new HttpRequestMessage(HttpMethod.Post, uri);
+            HttpResponseMessage response = await this._fixture.HttpClient.SendAsync(request);
+            Assert.Equal(HttpStatusCode.OK, response.StatusCode);
+        }
+
+        [Fact]
+        public async Task HostLog_Anonymous_Fails()
+        {
+            var request = new HttpRequestMessage(HttpMethod.Post, "admin/host/log");
+            request.Headers.Add(ScriptConstants.AntaresLogIdHeaderName, "xyz");
+            var response = await this._fixture.HttpClient.SendAsync(request);
+            Assert.Equal(HttpStatusCode.Unauthorized, response.StatusCode);
+
+            request = new HttpRequestMessage(HttpMethod.Post, "admin/host/log");
+            response = await this._fixture.HttpClient.SendAsync(request);
+            Assert.Equal(HttpStatusCode.Unauthorized, response.StatusCode);
+        }
+
+        [Fact]
+        public async Task HostLog_AdminLevel_Succeeds()
+        {
+            var request = new HttpRequestMessage(HttpMethod.Post, "admin/host/log");
+            request.Headers.Add(AuthorizationLevelAttribute.FunctionsKeyHeaderName, MasterKey);
+            var logs = new HostLogEntry[]
+            {
+                new HostLogEntry
+                {
+                    Level = TraceLevel.Verbose,
+                    Source = "ScaleController",
+                    Message = string.Format("Test Verbose log {0}", Guid.NewGuid().ToString())
+                },
+                new HostLogEntry
+                {
+                    Level = TraceLevel.Info,
+                    Source = "ScaleController",
+                    Message = string.Format("Test Info log {0}", Guid.NewGuid().ToString())
+                },
+                new HostLogEntry
+                {
+                    Level = TraceLevel.Warning,
+                    Source = "ScaleController",
+                    Message = string.Format("Test Warning log {0}", Guid.NewGuid().ToString())
+                },
+                new HostLogEntry
+                {
+                    Level = TraceLevel.Error,
+                    Source = "ScaleController",
+                    FunctionName = "TestFunction",
+                    Message = string.Format("Test Error log {0}", Guid.NewGuid().ToString())
+                }
+            };
+            var serializer = new JsonSerializer();
+            var writer = new StringWriter();
+            serializer.Serialize(writer, logs);
+            var json = writer.ToString();
+            request.Content = new StringContent(json);
+            request.Content.Headers.ContentType = new MediaTypeHeaderValue("application/json");
+
+            var response = await this._fixture.HttpClient.SendAsync(request);
+            Assert.Equal(HttpStatusCode.OK, response.StatusCode);
+
+            await Task.Delay(1000);
+
+            var hostLogs = await TestHelpers.GetHostLogsAsync();
+            foreach (var expectedLog in logs.Select(p => p.Message))
+            {
+                Assert.Equal(1, hostLogs.Count(p => p.Contains(expectedLog)));
+            }
+        }
+
+        [Fact]
+        public async Task HostStatus_AdminLevel_Succeeds()
         {
             string uri = "admin/host/status";
             HttpRequestMessage request = new HttpRequestMessage(HttpMethod.Get, uri);
-            request.Headers.Add("x-functions-key", "t8laajal0a1ajkgzoqlfv5gxr4ebhqozebw4qzdy");
+            request.Headers.Add(AuthorizationLevelAttribute.FunctionsKeyHeaderName, MasterKey);
 
             HttpResponseMessage response = await GetHostStatusAsync();
 
@@ -885,15 +1026,17 @@ namespace Microsoft.Azure.WebJobs.Script.Tests
             string content = await response.Content.ReadAsStringAsync();
             JObject jsonContent = JObject.Parse(content);
 
+            Assert.Equal(3, jsonContent.Properties().Count());
             AssemblyFileVersionAttribute fileVersionAttr = typeof(HostStatus).Assembly.GetCustomAttribute<AssemblyFileVersionAttribute>();
             string expectedVersion = fileVersionAttr.Version;
-            string expectedId = "5a709861cab44e68bfed5d2c2fe7fc0c";
-            Assert.Equal(expectedId, jsonContent["id"].ToString());
+            Assert.True(((string)jsonContent["id"]).Length > 0);
             Assert.Equal(expectedVersion, jsonContent["version"].ToString());
+            var state = (string)jsonContent["state"];
+            Assert.True(state == "Running" || state == "Created");
 
             // Now ensure XML content works
             request = new HttpRequestMessage(HttpMethod.Get, uri);
-            request.Headers.Add("x-functions-key", "t8laajal0a1ajkgzoqlfv5gxr4ebhqozebw4qzdy");
+            request.Headers.Add(AuthorizationLevelAttribute.FunctionsKeyHeaderName, MasterKey);
             request.Headers.Add("Accept", "text/xml");
 
             response = await this._fixture.HttpClient.SendAsync(request);
@@ -904,17 +1047,89 @@ namespace Microsoft.Azure.WebJobs.Script.Tests
             var node = doc.Descendants(XName.Get("Version", ns)).Single();
             Assert.Equal(expectedVersion, node.Value);
             node = doc.Descendants(XName.Get("Id", ns)).Single();
-            Assert.Equal(expectedId, node.Value);
+            Assert.True(node.Value.Length > 0);
+            node = doc.Descendants(XName.Get("State", ns)).Single();
+            Assert.True(node.Value == "Running" || node.Value == "Created");
 
             node = doc.Descendants(XName.Get("Errors", ns)).Single();
             Assert.True(node.IsEmpty);
+        }
+
+        [Fact]
+        public async Task HostStatus_AnonymousAntaresInteral_CheckLoad_Succeeds()
+        {
+            string uri = "admin/host/status?checkLoad=1";
+            HttpRequestMessage request = new HttpRequestMessage(HttpMethod.Get, uri);
+
+            var vars = new Dictionary<string, string>
+            {
+                { EnvironmentSettingNames.AzureWebsiteInstanceId, "123" },
+                { EnvironmentSettingNames.AzureWebsiteAppCountersName, "{\"connections\": 290, \"connectionLimit\": 300}" }
+            };
+            using (var env = new TestScopedEnvironmentVariable(vars))
+            {
+                HttpResponseMessage response = await this._fixture.HttpClient.SendAsync(request);
+
+                Assert.Equal(HttpStatusCode.OK, response.StatusCode);
+                string content = await response.Content.ReadAsStringAsync();
+                var jsonContent = JObject.Parse(content);
+
+                Assert.Equal(4, jsonContent.Properties().Count());
+                AssemblyFileVersionAttribute fileVersionAttr = typeof(HostStatus).Assembly.GetCustomAttribute<AssemblyFileVersionAttribute>();
+                string expectedVersion = fileVersionAttr.Version;
+                Assert.True(((string)jsonContent["id"]).Length > 0);
+                Assert.Equal(expectedVersion, jsonContent["version"].ToString());
+                var state = (string)jsonContent["state"];
+                Assert.True(state == "Running" || state == "Created");
+                JObject loadStatus = (JObject)jsonContent["load"];
+                Assert.True((bool)loadStatus["isHigh"]);
+            }
+        }
+
+        [Fact]
+        public async Task HostStatus_AnonymousLevelRequest_Fails()
+        {
+            string uri = "admin/host/status";
+            var request = new HttpRequestMessage(HttpMethod.Get, uri);
+            var response = await this._fixture.HttpClient.SendAsync(request);
+            Assert.Equal(HttpStatusCode.Unauthorized, response.StatusCode);
+        }
+
+        [Fact]
+        public async Task HostStatus_AdminLevelRequest_WithLoad_Succeeds()
+        {
+            try
+            {
+                var counters = new JObject
+                {
+                    { "connections", 289 },
+                    { "connectionLimit", 300 }
+                };
+                Environment.SetEnvironmentVariable(EnvironmentSettingNames.AzureWebsiteAppCountersName, counters.ToString());
+
+                string uri = "admin/host/status?checkLoad=1";
+                var request = new HttpRequestMessage(HttpMethod.Get, uri);
+                request.Headers.Add(AuthorizationLevelAttribute.FunctionsKeyHeaderName, MasterKey);
+                var response = await this._fixture.HttpClient.SendAsync(request);
+                Assert.Equal(HttpStatusCode.OK, response.StatusCode);
+
+                string json = await response.Content.ReadAsStringAsync();
+                JObject jsonContent = JObject.Parse(json);
+                Assert.Equal(4, jsonContent.Properties().Count());
+                JObject loadStatus = (JObject)jsonContent["load"];
+                Assert.True((bool)loadStatus["isHigh"]);
+            }
+            finally
+            {
+                Environment.SetEnvironmentVariable(EnvironmentSettingNames.AzureWebsiteAppCountersName, string.Empty);
+            }
         }
 
         private async Task<HttpResponseMessage> GetHostStatusAsync()
         {
             string uri = "admin/host/status";
             HttpRequestMessage request = new HttpRequestMessage(HttpMethod.Get, uri);
-            request.Headers.Add("x-functions-key", "t8laajal0a1ajkgzoqlfv5gxr4ebhqozebw4qzdy");
+            request.Headers.Add(AuthorizationLevelAttribute.FunctionsKeyHeaderName, MasterKey);
 
             return await this._fixture.HttpClient.SendAsync(request);
         }
@@ -1005,11 +1220,14 @@ namespace Microsoft.Azure.WebJobs.Script.Tests
             {
                 HttpServer?.Dispose();
                 HttpClient?.Dispose();
+
+                TestHelpers.ClearHostLogs();
             }
 
             private class TestEntity : TableEntity
             {
                 public string Title { get; set; }
+
                 public int Status { get; set; }
             }
         }

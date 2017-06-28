@@ -5,6 +5,7 @@ using System;
 using System.Collections.Generic;
 using System.Collections.ObjectModel;
 using System.Dynamic;
+using System.Globalization;
 using System.IO;
 using System.Linq;
 using System.Net;
@@ -22,8 +23,8 @@ namespace Microsoft.Azure.WebJobs.Script.Binding
 {
     public class HttpBinding : FunctionBinding, IResultProcessingBinding
     {
-        public HttpBinding(ScriptHostConfiguration config, BindingMetadata metadata, FileAccess access) :
-            base(config, metadata, access)
+        public HttpBinding(ScriptHostConfiguration config, BindingMetadata metadata, FileAccess access)
+            : base(config, metadata, access)
         {
         }
 
@@ -57,8 +58,8 @@ namespace Microsoft.Azure.WebJobs.Script.Binding
             {
                 try
                 {
-                    // attempt to read the content as json
-                    content = JObject.Parse(stringContent);
+                    // attempt to read the content as JObject/JArray
+                    content = JsonConvert.DeserializeObject(stringContent);
                 }
                 catch (JsonException)
                 {
@@ -121,12 +122,10 @@ namespace Microsoft.Azure.WebJobs.Script.Binding
                     headers = headersValue;
                 }
 
-                object statusValue;
-                if ((responseObject.TryGetValue("statusCode", out statusValue, ignoreCase: true) ||
-                     responseObject.TryGetValue("status", out statusValue, ignoreCase: true)) &&
-                     (statusValue is int || statusValue is string))
+                HttpStatusCode responseStatusCode;
+                if (TryParseStatusCode(responseObject, out responseStatusCode))
                 {
-                    statusCode = (HttpStatusCode)Convert.ToInt32(statusValue);
+                    statusCode = responseStatusCode;
                 }
 
                 bool isRawValue;
@@ -137,11 +136,50 @@ namespace Microsoft.Azure.WebJobs.Script.Binding
             }
         }
 
+        internal static bool TryParseStatusCode(IDictionary<string, object> responseObject, out HttpStatusCode statusCode)
+        {
+            statusCode = HttpStatusCode.OK;
+            object statusValue;
+
+            if (!responseObject.TryGetValue("statusCode", out statusValue, ignoreCase: true) &&
+                !responseObject.TryGetValue("status", out statusValue, ignoreCase: true))
+            {
+                return false;
+            }
+
+            if (statusValue is HttpStatusCode ||
+                statusValue is int)
+            {
+                statusCode = (HttpStatusCode)statusValue;
+                return true;
+            }
+
+            if (statusValue is uint ||
+                statusValue is short ||
+                statusValue is ushort ||
+                statusValue is long ||
+                statusValue is ulong)
+            {
+                statusCode = (HttpStatusCode)Convert.ToInt32(statusValue);
+                return true;
+            }
+
+            var stringValue = statusValue as string;
+            int parsedStatusCode;
+            if (stringValue != null && int.TryParse(stringValue, NumberStyles.Integer, CultureInfo.InvariantCulture, out parsedStatusCode))
+            {
+                statusCode = (HttpStatusCode)parsedStatusCode;
+                return true;
+            }
+
+            return false;
+        }
+
         private static HttpResponseMessage CreateResponse(HttpRequestMessage request, HttpStatusCode statusCode, object content, IDictionary<string, object> headers, bool isRawResponse)
         {
             if (isRawResponse)
             {
-                // We only write the response through one of the formatters if 
+                // We only write the response through one of the formatters if
                 // the function hasn't indicated that it wants to write the raw response
                 return new HttpResponseMessage(statusCode) { Content = CreateResultContent(content) };
             }
@@ -251,53 +289,63 @@ namespace Microsoft.Azure.WebJobs.Script.Binding
                     // content header collection
                     case "content-type":
                         MediaTypeHeaderValue mediaType = null;
-                        if (MediaTypeHeaderValue.TryParse(header.Value.ToString(), out mediaType))
+                        if (response.Content != null && MediaTypeHeaderValue.TryParse(header.Value.ToString(), out mediaType))
                         {
                             response.Content.Headers.ContentType = mediaType;
                         }
                         break;
                     case "content-length":
                         long contentLength;
-                        if (long.TryParse(header.Value.ToString(), out contentLength))
+                        if (response.Content != null && long.TryParse(header.Value.ToString(), out contentLength))
                         {
                             response.Content.Headers.ContentLength = contentLength;
                         }
                         break;
                     case "content-disposition":
-                        response.Content.Headers.ContentDisposition = new ContentDispositionHeaderValue(header.Value.ToString());
+                        ContentDispositionHeaderValue contentDisposition = null;
+                        if (response.Content != null && ContentDispositionHeaderValue.TryParse(header.Value.ToString(), out contentDisposition))
+                        {
+                            response.Content.Headers.ContentDisposition = contentDisposition;
+                        }
                         break;
                     case "content-encoding":
                     case "content-language":
                     case "content-range":
-                        response.Content.Headers.Add(header.Key, header.Value.ToString());
+                        if (response.Content != null)
+                        {
+                            response.Content.Headers.Add(header.Key, header.Value.ToString());
+                        }
                         break;
                     case "content-location":
                         Uri uri;
-                        if (Uri.TryCreate(header.Value.ToString(), UriKind.Absolute, out uri))
+                        if (response.Content != null && Uri.TryCreate(header.Value.ToString(), UriKind.Absolute, out uri))
                         {
                             response.Content.Headers.ContentLocation = uri;
                         }
                         break;
                     case "content-md5":
                         byte[] value;
-                        if (header.Value is string)
+                        if (response.Content != null)
                         {
-                            value = Convert.FromBase64String((string)header.Value);
+                            if (header.Value is string)
+                            {
+                                value = Convert.FromBase64String((string)header.Value);
+                            }
+                            else
+                            {
+                                value = header.Value as byte[];
+                            }
+                            response.Content.Headers.ContentMD5 = value;
                         }
-                        else
-                        {
-                            value = header.Value as byte[];
-                        }
-                        response.Content.Headers.ContentMD5 = value;
                         break;
                     case "expires":
-                        if (DateTimeOffset.TryParse(header.Value.ToString(), out dateTimeOffset))
+                        if (response.Content != null && DateTimeOffset.TryParse(header.Value.ToString(), out dateTimeOffset))
                         {
                             response.Content.Headers.Expires = dateTimeOffset;
                         }
                         break;
                     case "last-modified":
-                        if (DateTimeOffset.TryParse(header.Value.ToString(), out dateTimeOffset))
+                        if (response.Content != null && DateTimeOffset.TryParse(header.Value.ToString(), out dateTimeOffset))
                         {
                             response.Content.Headers.LastModified = dateTimeOffset;
                         }

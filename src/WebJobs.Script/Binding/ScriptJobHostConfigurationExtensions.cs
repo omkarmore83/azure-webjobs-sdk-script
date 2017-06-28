@@ -4,7 +4,7 @@
 using System;
 using Microsoft.Azure.WebJobs.Host.Config;
 
-namespace Microsoft.Azure.WebJobs.Script.Binding.Http
+namespace Microsoft.Azure.WebJobs.Script.Binding
 {
     public static class ScriptJobHostConfigurationExtensions
     {
@@ -27,8 +27,8 @@ namespace Microsoft.Azure.WebJobs.Script.Binding.Http
                     throw new ArgumentNullException("context");
                 }
 
-                context.Config.RegisterBindingExtension(new HttpTriggerAttributeBindingProvider());
-                context.Config.RegisterBindingExtension(new ManualTriggerAttributeBindingProvider());
+                context.AddBindingRule<ManualTriggerAttribute>()
+                    .BindToTrigger(new ManualTriggerAttributeBindingProvider());
             }
         }
     }

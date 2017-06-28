@@ -3,8 +3,15 @@
 
 using System;
 using System.Collections.Generic;
+using System.Diagnostics;
 using System.Dynamic;
+using System.Linq;
+using System.Reflection;
 using System.Text;
+using System.Threading;
+using System.Threading.Tasks;
+using Microsoft.Azure.WebJobs.Script.Config;
+using Moq;
 using Newtonsoft.Json.Linq;
 using Xunit;
 
@@ -17,18 +24,21 @@ namespace Microsoft.Azure.WebJobs.Script.Tests
     public struct TestStruct
     {
         public string Name { get; set; }
+
         public string Location { get; set; }
     }
 
     public class TestPoco
     {
         public string Name { get; set; }
+
         public string Location { get; set; }
     }
 
     public class TestPocoEx : TestPoco
     {
         public int Age { get; set; }
+
         public string Phone { get; set; }
 
         public string Readonly { get; }
@@ -38,6 +48,87 @@ namespace Microsoft.Azure.WebJobs.Script.Tests
 
     public class UtilityTests
     {
+        [Fact]
+        public void TryMatchAssembly_ReturnsExpectedResult()
+        {
+            Assembly assembly = null;
+            bool result = Utility.TryMatchAssembly("Microsoft.Azure.WebJobs.Extensions.SendGrid", typeof(SendGridAttribute), out assembly);
+            Assert.True(result);
+            Assert.Same(typeof(SendGridAttribute).Assembly, assembly);
+
+            result = Utility.TryMatchAssembly("MICROSOFT.AZURE.WEBJOBS.EXTENSIONS.SENDGRID", typeof(SendGridAttribute), out assembly);
+            Assert.True(result);
+            Assert.Same(typeof(SendGridAttribute).Assembly, assembly);
+
+            result = Utility.TryMatchAssembly("Microsoft.Azure.WebJobs.FooBar", typeof(SendGridAttribute), out assembly);
+            Assert.False(result);
+            Assert.Null(assembly);
+        }
+
+        [Fact]
+        public async Task DelayWithBackoffAsync_Returns_WhenCancelled()
+        {
+            var tokenSource = new CancellationTokenSource();
+            tokenSource.CancelAfter(500);
+
+            // set up a long delay and ensure it is cancelled
+            Stopwatch sw = new Stopwatch();
+            sw.Start();
+            await Utility.DelayWithBackoffAsync(20, tokenSource.Token);
+            sw.Stop();
+            Assert.True(sw.ElapsedMilliseconds < 1000, $"Expected sw.ElapsedMilliseconds < 1000; Actual: {sw.ElapsedMilliseconds}");
+        }
+
+        [Fact]
+        public async Task DelayWithBackoffAsync_DelaysAsExpected()
+        {
+            Stopwatch sw = new Stopwatch();
+            sw.Start();
+            await Utility.DelayWithBackoffAsync(2, CancellationToken.None);
+            sw.Stop();
+            Assert.True(sw.ElapsedMilliseconds >= 2000, $"Expected sw.ElapsedMilliseconds >= 2000; Actual: {sw.ElapsedMilliseconds}");
+        }
+
+        [Theory]
+        [InlineData(1, null, null, null, "00:00:00")]
+        [InlineData(2, null, null, null, "00:00:02")]
+        [InlineData(3, null, null, null, "00:00:04")]
+        [InlineData(4, null, null, null, "00:00:08")]
+        [InlineData(5, null, null, null, "00:00:016")]
+        [InlineData(6, null, null, null, "00:00:32")]
+        [InlineData(6, null, null, "00:00:20", "00:00:20")] // test min/max
+        [InlineData(2, null, "00:00:10", null, "00:00:10")]
+        [InlineData(6, null, "00:00:10", "00:00:20", "00:00:20")]
+        [InlineData(2, null, "00:00:10", "00:00:20", "00:00:10")]
+        [InlineData(1, "00:00:00.100", null, null, "00:00:00.000")] // changing the base unit
+        [InlineData(2, "00:00:00.100", null, null, "00:00:00.200")]
+        [InlineData(3, "00:00:00.100", null, null, "00:00:00.400")]
+        [InlineData(4, "00:00:00.100", null, null, "00:00:00.800")]
+        [InlineData(5, "00:00:00.100", null, null, "00:00:01.600")]
+        [InlineData(6, "00:00:00.100", null, null, "00:00:03.200")]
+        public void ComputeBackoff_ReturnsExpectedValue(int exponent, string unitValue, string minValue, string maxValue, string expected)
+        {
+            TimeSpan? unit = null;
+            if (!string.IsNullOrEmpty(unitValue))
+            {
+                unit = TimeSpan.Parse(unitValue);
+            }
+            TimeSpan? min = null;
+            if (!string.IsNullOrEmpty(minValue))
+            {
+                min = TimeSpan.Parse(minValue);
+            }
+            TimeSpan? max = null;
+            if (!string.IsNullOrEmpty(maxValue))
+            {
+                max = TimeSpan.Parse(maxValue);
+            }
+
+            TimeSpan result = Utility.ComputeBackoff(exponent, unit, min, max);
+            TimeSpan expectedTimespan = TimeSpan.Parse(expected);
+            Assert.Equal(expectedTimespan, result);
+        }
+
         [Theory]
         [InlineData(typeof(TestPoco), true)]
         [InlineData(typeof(TestStruct), true)]
@@ -69,7 +160,7 @@ namespace Microsoft.Azure.WebJobs.Script.Tests
         [Fact]
         public void ApplyBindingData_HandlesNestedJsonPayloads()
         {
-            string input = "{ 'test': 'testing', 'baz': 123, 'nested': [ { 'nesting': 'yes' } ] }";
+            string input = "{ 'test': 'testing', 'baz': 123, 'subObject': { 'p1': 777, 'p2': 888 }, 'subArray': [ { 'subObject': 'foobar' } ] }";
 
             var bindingData = new Dictionary<string, object>
             {
@@ -80,9 +171,13 @@ namespace Microsoft.Azure.WebJobs.Script.Tests
 
             Utility.ApplyBindingData(input, bindingData);
 
+            Assert.Equal(5, bindingData.Count);
             Assert.Equal("Value1", bindingData["foo"]);
             Assert.Equal("Value2", bindingData["bar"]);
             Assert.Equal("testing", bindingData["test"]);
+
+            JObject subObject = (JObject)bindingData["subObject"];
+            Assert.Equal(888, (int)subObject["p2"]);
 
             // input data overrides ambient data
             Assert.Equal("123", bindingData["baz"]);
@@ -179,6 +274,77 @@ namespace Microsoft.Azure.WebJobs.Script.Tests
             Assert.Equal(resultChild["Name"], child.Name);
             Assert.Equal(resultChild["Location"], child.Location);
             Assert.Equal(resultChild["Age"], child.Age);
+        }
+
+        [Fact]
+        public void ToJson_StripsFunctions_FromExpandoObjects()
+        {
+            // {
+            //    func: () => { },
+            //    nested:
+            //            {
+            //                func: () => { }
+            //    },
+            //    array: [
+            //        { func: () => { } }
+            //    ],
+            //    value: "value"
+            // };
+
+            Action f = () => { };
+            dynamic val = new ExpandoObject();
+            val.func = f;
+            val.nested = new ExpandoObject() as dynamic;
+            val.nested.func = f;
+            dynamic arrExpando = new ExpandoObject();
+            arrExpando.func = f;
+            val.array = new ExpandoObject[1] { arrExpando as ExpandoObject };
+            val.value = "value";
+
+            var json = Utility.ToJson(val as ExpandoObject, Newtonsoft.Json.Formatting.None);
+            Assert.Equal("{\"nested\":{},\"array\":[{}],\"value\":\"value\"}", json);
+        }
+
+        [Theory]
+        [InlineData(typeof(ExpandoObject), false)]
+        [InlineData(typeof(string), false)]
+        [InlineData(typeof(int), false)]
+        [InlineData(typeof(int?), true)]
+        public void IsNullable_ReturnsExpectedResult(Type type, bool expected)
+        {
+            Assert.Equal(expected, Utility.IsNullable(type));
+        }
+
+        [Theory]
+        [InlineData("TEST-FUNCTIONS--", "test-functions")]
+        [InlineData("TEST-FUNCTIONS-XXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXX", "test-functions-xxxxxxxxxxxxxxxxx")]
+        [InlineData("TEST-FUNCTIONS-XXXXXXXXXXXXXXXX-XXXX", "test-functions-xxxxxxxxxxxxxxxx")] /* 32nd character is a '-' */
+        [InlineData(null, null)]
+        public void GetDefaultHostId_AzureHost_ReturnsExpectedResult(string input, string expected)
+        {
+            var config = new ScriptHostConfiguration();
+            var scriptSettingsManagerMock = new Mock<ScriptSettingsManager>(MockBehavior.Strict);
+            scriptSettingsManagerMock.SetupGet(p => p.AzureWebsiteUniqueSlotName).Returns(() => input);
+
+            string hostId = Utility.GetDefaultHostId(scriptSettingsManagerMock.Object, config);
+            Assert.Equal(expected, hostId);
+        }
+
+        [Fact]
+        public void GetDefaultHostId_SelfHost_ReturnsExpectedResult()
+        {
+            var config = new ScriptHostConfiguration
+            {
+                IsSelfHost = true,
+                RootScriptPath = @"c:\testing\FUNCTIONS-TEST\test$#"
+            };
+            var scriptSettingsManagerMock = new Mock<ScriptSettingsManager>(MockBehavior.Strict);
+
+            string hostId = Utility.GetDefaultHostId(scriptSettingsManagerMock.Object, config);
+            string sanitizedMachineName = Environment.MachineName
+                    .Where(char.IsLetterOrDigit)
+                    .Aggregate(new StringBuilder(), (b, c) => b.Append(c)).ToString().ToLowerInvariant();
+            Assert.Equal($"{sanitizedMachineName}-789851553", hostId);
         }
     }
 }

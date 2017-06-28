@@ -20,7 +20,7 @@ namespace Microsoft.Azure.WebJobs.Script.Tests
     public static class TestHelpers
     {
         /// <summary>
-        /// Common root directory that functions tests create temporary directories under.
+        /// Gets the common root directory that functions tests create temporary directories under.
         /// This enables us to clean up test files by deleting this single directory.
         /// </summary>
         public static string FunctionsTestDirectory
@@ -31,14 +31,15 @@ namespace Microsoft.Azure.WebJobs.Script.Tests
             }
         }
 
-        public static async Task Await(Func<bool> condition, int timeout = 60 * 1000, int pollingInterval = 2 * 1000)
+        public static async Task Await(Func<bool> condition, int timeout = 60 * 1000, int pollingInterval = 2 * 1000, bool throwWhenDebugging = false)
         {
             DateTime start = DateTime.Now;
             while (!condition())
             {
                 await Task.Delay(pollingInterval);
 
-                if ((DateTime.Now - start).TotalMilliseconds > timeout)
+                bool shouldThrow = !Debugger.IsAttached || (Debugger.IsAttached && throwWhenDebugging);
+                if (shouldThrow && (DateTime.Now - start).TotalMilliseconds > timeout)
                 {
                     throw new ApplicationException("Condition not reached within timeout.");
                 }
@@ -77,11 +78,50 @@ namespace Microsoft.Azure.WebJobs.Script.Tests
             }
         }
 
+        public static void ClearHostLogs()
+        {
+            DirectoryInfo directory = GetHostLogFileDirectory();
+            if (directory.Exists)
+            {
+                foreach (var file in directory.GetFiles())
+                {
+                    try
+                    {
+                        file.Delete();
+                    }
+                    catch
+                    {
+                        // best effort
+                    }
+                }
+            }
+        }
+
         public static async Task<IList<string>> GetFunctionLogsAsync(string functionName, bool throwOnNoLogs = true)
         {
             await Task.Delay(FileTraceWriter.LogFlushIntervalMs);
 
             DirectoryInfo directory = GetFunctionLogFileDirectory(functionName);
+            FileInfo lastLogFile = directory.GetFiles("*.log").OrderByDescending(p => p.LastWriteTime).FirstOrDefault();
+
+            if (lastLogFile != null)
+            {
+                string[] logs = File.ReadAllLines(lastLogFile.FullName);
+                return new Collection<string>(logs.ToList());
+            }
+            else if (throwOnNoLogs)
+            {
+                throw new InvalidOperationException("No logs written!");
+            }
+
+            return new Collection<string>();
+        }
+
+        public static async Task<IList<string>> GetHostLogsAsync(bool throwOnNoLogs = true)
+        {
+            await Task.Delay(FileTraceWriter.LogFlushIntervalMs);
+
+            DirectoryInfo directory = GetHostLogFileDirectory();
             FileInfo lastLogFile = directory.GetFiles("*.log").OrderByDescending(p => p.LastWriteTime).FirstOrDefault();
 
             if (lastLogFile != null)
@@ -113,8 +153,14 @@ namespace Microsoft.Azure.WebJobs.Script.Tests
 
         public static DirectoryInfo GetFunctionLogFileDirectory(string functionName)
         {
-            string functionLogsPath = Path.Combine(Path.GetTempPath(), "Functions", "Function", functionName);
-            return new DirectoryInfo(functionLogsPath);
+            string path = Path.Combine(Path.GetTempPath(), "Functions", "Function", functionName);
+            return new DirectoryInfo(path);
+        }
+
+        public static DirectoryInfo GetHostLogFileDirectory()
+        {
+            string path = Path.Combine(Path.GetTempPath(), "Functions", "Host");
+            return new DirectoryInfo(path);
         }
 
         public static FunctionBinding CreateTestBinding(JObject json)

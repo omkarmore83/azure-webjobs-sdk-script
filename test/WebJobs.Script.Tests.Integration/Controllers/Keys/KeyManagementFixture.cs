@@ -14,9 +14,13 @@ namespace Microsoft.Azure.WebJobs.Script.Tests.Controllers
 
         public Dictionary<string, string> TestFunctionKeys { get; set; }
 
+        public Dictionary<string, string> TestSystemKeys { get; set; }
+
         public Mock<TestSecretManager> SecretManagerMock { get; set; }
 
-        public virtual string TestFunctionName => _testFunctionName;
+        public virtual string TestKeyScope => _testFunctionName;
+
+        public virtual ScriptSecretsType SecretsType => ScriptSecretsType.Function;
 
         protected override void RegisterDependencies(ContainerBuilder builder, WebHostSettings settings)
         {
@@ -37,8 +41,8 @@ namespace Microsoft.Azure.WebJobs.Script.Tests.Controllers
         {
             var manager = new Mock<TestSecretManager>();
             manager.CallBase = true;
-            manager.Setup(s => s.GetFunctionSecrets(_testFunctionName, false))
-                .Returns(() => TestFunctionKeys);
+            manager.Setup(s => s.GetFunctionSecretsAsync(_testFunctionName, false))
+                .ReturnsAsync(() => TestFunctionKeys);
 
             return manager;
         }

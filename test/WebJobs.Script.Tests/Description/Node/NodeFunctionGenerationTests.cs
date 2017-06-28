@@ -12,7 +12,10 @@ using System.Threading.Tasks;
 using Microsoft.Azure.WebJobs.Host;
 using Microsoft.Azure.WebJobs.Script.Config;
 using Microsoft.Azure.WebJobs.Script.Description;
+using Microsoft.Azure.WebJobs.Script.Eventing;
+using Microsoft.Extensions.Logging;
 using Microsoft.ServiceBus.Messaging;
+using Moq;
 using Newtonsoft.Json.Linq;
 using Xunit;
 
@@ -43,7 +46,29 @@ namespace Microsoft.Azure.WebJobs.Script.Tests
             Assert.Equal(typeof(TimerInfo), parameter.ParameterType);
             TimerTriggerAttribute attribute = parameter.GetCustomAttribute<TimerTriggerAttribute>();
             Assert.Equal("* * * * * *", attribute.ScheduleExpression);
+            Assert.True(attribute.UseMonitor);
             Assert.True(attribute.RunOnStartup);
+
+            trigger = BindingMetadata.Create(new JObject
+            {
+                { "type", "TimerTrigger" },
+                { "name", "timerInfo" },
+                { "schedule", "* * * * * *" },
+                { "useMonitor", false },
+                { "direction", "in" }
+            });
+            method = GenerateMethod(trigger);
+
+            VerifyCommonProperties(method);
+
+            // verify trigger parameter
+            parameter = method.GetParameters()[0];
+            Assert.Equal("timerInfo", parameter.Name);
+            Assert.Equal(typeof(TimerInfo), parameter.ParameterType);
+            attribute = parameter.GetCustomAttribute<TimerTriggerAttribute>();
+            Assert.Equal("* * * * * *", attribute.ScheduleExpression);
+            Assert.False(attribute.UseMonitor);
+            Assert.False(attribute.RunOnStartup);
         }
 
         [Fact]
@@ -162,7 +187,7 @@ namespace Microsoft.Azure.WebJobs.Script.Tests
         {
             Assert.Equal("Test", method.Name);
             ParameterInfo[] parameters = method.GetParameters();
-            Assert.Equal(4, parameters.Length);
+            Assert.Equal(5, parameters.Length);
             Assert.Equal(typeof(Task), method.ReturnType);
 
             // verify TextWriter parameter
@@ -179,6 +204,11 @@ namespace Microsoft.Azure.WebJobs.Script.Tests
             parameter = parameters[3];
             Assert.Equal("_context", parameter.Name);
             Assert.Equal(typeof(ExecutionContext), parameter.ParameterType);
+
+            // verify ExecutionContext parameter
+            parameter = parameters[4];
+            Assert.Equal("_logger", parameter.Name);
+            Assert.Equal(typeof(ILogger), parameter.ParameterType);
         }
 
         private static MethodInfo GenerateMethod(BindingMetadata trigger)
@@ -192,20 +222,22 @@ namespace Microsoft.Azure.WebJobs.Script.Tests
             List<FunctionMetadata> functions = new List<FunctionMetadata>();
             functions.Add(metadata);
 
+            var environment = new Mock<IScriptHostEnvironment>();
+            var eventManager = new Mock<IScriptEventManager>();
             ScriptHostConfiguration scriptConfig = new ScriptHostConfiguration()
             {
                 RootScriptPath = rootPath
             };
 
             Collection<FunctionDescriptor> functionDescriptors = null;
-            using (ScriptHost host = ScriptHost.Create(SettingsManager, scriptConfig))
+            using (ScriptHost host = ScriptHost.Create(environment.Object, eventManager.Object, scriptConfig, SettingsManager))
             {
                 FunctionDescriptorProvider[] descriptorProviders = new FunctionDescriptorProvider[]
                 {
-                new NodeFunctionDescriptorProvider(host, scriptConfig)
+                    new NodeFunctionDescriptorProvider(host, scriptConfig)
                 };
 
-                functionDescriptors = host.ReadFunctions(functions, descriptorProviders);
+                functionDescriptors = host.GetFunctionDescriptors(functions, descriptorProviders);
             }
 
             Type t = FunctionGenerator.Generate("TestScriptHost", "Host.Functions", null, functionDescriptors);

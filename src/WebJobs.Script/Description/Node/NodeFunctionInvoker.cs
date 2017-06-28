@@ -3,59 +3,81 @@
 
 using System;
 using System.Collections.Generic;
+using System.Collections.Immutable;
 using System.Collections.ObjectModel;
+using System.Diagnostics;
 using System.Dynamic;
 using System.Globalization;
 using System.IO;
 using System.Linq;
 using System.Net.Http;
 using System.Net.Http.Headers;
+using System.Threading;
 using System.Threading.Tasks;
 using EdgeJs;
+using Microsoft.Azure.WebJobs.Extensions.Http;
 using Microsoft.Azure.WebJobs.Host;
 using Microsoft.Azure.WebJobs.Script.Binding;
+using Microsoft.Azure.WebJobs.Script.Diagnostics;
+using Microsoft.CodeAnalysis;
+using Microsoft.CodeAnalysis.Scripting;
 using Newtonsoft.Json;
 using Newtonsoft.Json.Linq;
+using ScriptFunc = System.Func<object, System.Threading.Tasks.Task<object>>;
 
 namespace Microsoft.Azure.WebJobs.Script.Description
 {
     // TODO: make this internal
-    [CLSCompliant(false)]
     public class NodeFunctionInvoker : FunctionInvokerBase
     {
         private readonly Collection<FunctionBinding> _inputBindings;
         private readonly Collection<FunctionBinding> _outputBindings;
-        private readonly string _script;
+        private readonly ICompilationService<IJavaScriptCompilation> _compilationService;
         private readonly BindingMetadata _trigger;
         private readonly string _entryPoint;
+        private readonly IMetricsLogger _metricsLogger;
 
-        private Func<object, Task<object>> _scriptFunc;
-        private static Func<object, Task<object>> _clearRequireCache;
-        private static Func<object, Task<object>> _globalInitializationFunc;
+        private ScriptFunc _scriptFunc;
+        private static ScriptFunc _clearRequireCache;
+        private static ScriptFunc _globalInitializationFunc;
+        private FunctionLoader<ScriptFunc> _functionLoader;
+        private Func<Task> _reloadScript;
         private static string _functionTemplate;
         private static string _clearRequireCacheScript;
         private static string _globalInitializationScript;
-        private static bool _initialized = false;
-        private static readonly object _initializationSyncRoot = new object();
+        private static Lazy<Task> _initializer = new Lazy<Task>(InitializeAsync, LazyThreadSafetyMode.ExecutionAndPublication);
 
         static NodeFunctionInvoker()
         {
             // node cwd is edge nuget package (double_edge.js)
-            _functionTemplate = @"return require('../Content/Script/functions.js').createFunction(require('{0}'));";
-            _clearRequireCacheScript = @"return require('../Content/Script/functions.js').clearRequireCache;";
-            _globalInitializationScript = @"return require('../Content/Script/functions.js').globalInitialization;";
+            _functionTemplate = @"return require('../azurefunctions/functions.js').createFunction(require('{0}'));";
+            _clearRequireCacheScript = @"return require('../azurefunctions/functions.js').clearRequireCache;";
+            _globalInitializationScript = @"return require('../azurefunctions/functions.js').globalInitialization;";
         }
 
         internal NodeFunctionInvoker(ScriptHost host, BindingMetadata trigger, FunctionMetadata functionMetadata,
-            Collection<FunctionBinding> inputBindings, Collection<FunctionBinding> outputBindings, ITraceWriterFactory traceWriterFactory = null)
-            : base(host, functionMetadata, traceWriterFactory)
+            Collection<FunctionBinding> inputBindings, Collection<FunctionBinding> outputBindings,
+            ICompilationService<IJavaScriptCompilation> compilationService)
+            : base(host, functionMetadata)
         {
             _trigger = trigger;
-            string scriptFilePath = functionMetadata.ScriptFile.Replace('\\', '/');
-            _script = string.Format(CultureInfo.InvariantCulture, _functionTemplate, scriptFilePath);
             _inputBindings = inputBindings;
             _outputBindings = outputBindings;
             _entryPoint = functionMetadata.EntryPoint;
+            _compilationService = compilationService;
+
+            // If the compilation service writes to the common file system, we only want the primary host to generate
+            // compilation output
+            if (_compilationService.PersistsOutput)
+            {
+                _compilationService = new ConditionalJavaScriptCompilationService(Host.SettingsManager, compilationService, () => Host.IsPrimary);
+            }
+
+            _functionLoader = new FunctionLoader<ScriptFunc>(CreateFunctionTarget);
+            _metricsLogger = Host.ScriptConfig.HostConfig.GetService<IMetricsLogger>();
+
+            _reloadScript = ReloadScriptAsync;
+            _reloadScript = _reloadScript.Debounce();
 
             InitializeFileWatcherIfEnabled();
         }
@@ -66,7 +88,7 @@ namespace Microsoft.Azure.WebJobs.Script.Description
         /// </summary>
         public static event UnhandledExceptionEventHandler UnhandledException;
 
-        private static Func<object, Task<object>> GlobalInitializationFunc
+        private static ScriptFunc GlobalInitializationFunc
         {
             get
             {
@@ -78,22 +100,7 @@ namespace Microsoft.Azure.WebJobs.Script.Description
             }
         }
 
-        private Func<object, Task<object>> ScriptFunc
-        {
-            get
-            {
-                if (_scriptFunc == null)
-                {
-                    // We delay create the script function so any syntax errors in
-                    // the function will be reported to the Dashboard as an invocation
-                    // error rather than a host startup error
-                    _scriptFunc = Edge.Func(_script);
-                }
-                return _scriptFunc;
-            }
-        }
-
-        private static Func<object, Task<object>> ClearRequireCacheFunc
+        private static ScriptFunc ClearRequireCacheFunc
         {
             get
             {
@@ -105,38 +112,87 @@ namespace Microsoft.Azure.WebJobs.Script.Description
             }
         }
 
+        private async Task<ScriptFunc> GetFunctionTargetAsync()
+        {
+            ScriptFunc result = _scriptFunc;
+            if (result == null)
+            {
+                _scriptFunc = result = await _functionLoader.GetFunctionTargetAsync();
+            }
+
+            return result;
+        }
+
+        private async Task<ScriptFunc> CreateFunctionTarget(CancellationToken cancellationToken)
+        {
+            string eventName = string.Format(MetricEventNames.FunctionCompileLatencyByLanguageFormat, _compilationService.Language);
+
+            using (_metricsLogger.LatencyEvent(eventName))
+            {
+                IJavaScriptCompilation compilation = await CompileAndTraceAsync(LogTargets.System, suppressCompilationSummary: true);
+
+                string functionScriptPath = compilation.Emit(cancellationToken);
+                string script = string.Format(CultureInfo.InvariantCulture, _functionTemplate, functionScriptPath.Replace('\\', '/'));
+
+                return Edge.Func(script);
+            }
+        }
+
+        private async Task<IJavaScriptCompilation> CompileAndTraceAsync(LogTargets logTargets, bool throwOnCompilationError = true, bool suppressCompilationSummary = true)
+        {
+            try
+            {
+                IJavaScriptCompilation compilation = await _compilationService.GetFunctionCompilationAsync(Metadata);
+
+                if (compilation.SupportsDiagnostics)
+                {
+                    ImmutableArray<Diagnostic> diagnostics = compilation.GetDiagnostics();
+                    TraceCompilationDiagnostics(diagnostics, logTargets);
+
+                    if (!suppressCompilationSummary)
+                    {
+                        bool compilationSucceeded = !diagnostics.Any(d => d.Severity == DiagnosticSeverity.Error);
+
+                        TraceOnPrimaryHost(string.Format(CultureInfo.InvariantCulture, "Compilation {0}.", compilationSucceeded ? "succeeded" : "failed"), TraceLevel.Info);
+                    }
+                }
+
+                return compilation;
+            }
+            catch (CompilationErrorException ex)
+            {
+                TraceOnPrimaryHost("Function compilation error", TraceLevel.Error);
+                TraceCompilationDiagnostics(ex.Diagnostics, logTargets);
+
+                if (throwOnCompilationError)
+                {
+                    throw;
+                }
+            }
+
+            return null;
+        }
+
         protected override async Task InvokeCore(object[] parameters, FunctionInvocationContext context)
         {
-            EnsureInitialized();
+            // Ensure we're properly initialized
+            await _initializer.Value.ConfigureAwait(false);
 
             object input = parameters[0];
             string invocationId = context.ExecutionContext.InvocationId.ToString();
             DataType dataType = _trigger.DataType ?? DataType.String;
 
             var userTraceWriter = CreateUserTraceWriter(context.TraceWriter);
-            var scriptExecutionContext = CreateScriptExecutionContext(input, dataType, userTraceWriter, context);
+            var scriptExecutionContext = await CreateScriptExecutionContextAsync(input, dataType, userTraceWriter, context).ConfigureAwait(false);
             var bindingData = (Dictionary<string, object>)scriptExecutionContext["bindingData"];
 
             await ProcessInputBindingsAsync(context.Binder, scriptExecutionContext, bindingData);
 
-            object functionResult = await ScriptFunc(scriptExecutionContext);
+            ScriptFunc function = await GetFunctionTargetAsync();
+
+            object functionResult = await function(scriptExecutionContext);
 
             await ProcessOutputBindingsAsync(_outputBindings, input, context.Binder, bindingData, scriptExecutionContext, functionResult);
-        }
-
-        private static void EnsureInitialized()
-        {
-            if (!_initialized)
-            {
-                lock (_initializationSyncRoot)
-                {
-                    if (!_initialized)
-                    {
-                        Initialize();
-                        _initialized = true;
-                    }
-                }
-            }
         }
 
         private async Task ProcessInputBindingsAsync(Binder binder, Dictionary<string, object> executionContext, Dictionary<string, object> bindingData)
@@ -146,9 +202,10 @@ namespace Microsoft.Azure.WebJobs.Script.Description
             // create an ordered array of all inputs and add to
             // the execution context. These will be promoted to
             // positional parameters
-            List<object> inputs = new List<object>();
-            inputs.Add(bindings[_trigger.Name]);
-
+            var inputs = new List<object>
+            {
+                bindings[_trigger.Name]
+            };
             var nonTriggerInputBindings = _inputBindings.Where(p => !p.Metadata.IsTrigger);
             foreach (var inputBinding in nonTriggerInputBindings)
             {
@@ -198,8 +255,7 @@ namespace Microsoft.Azure.WebJobs.Script.Description
             {
                 // if the function returned binding values via the function result,
                 // apply them to context.bindings
-                IDictionary<string, object> functionOutputs = functionResult as IDictionary<string, object>;
-                if (functionOutputs != null)
+                if (functionResult is IDictionary<string, object> functionOutputs)
                 {
                     foreach (var output in functionOutputs)
                     {
@@ -236,47 +292,75 @@ namespace Microsoft.Azure.WebJobs.Script.Description
             }
         }
 
-        internal static void OnHostRestart()
+        internal static async Task OnHostRestartAsync()
         {
-            ClearRequireCacheFunc(null).GetAwaiter().GetResult();
+            await ClearRequireCacheFunc(null);
         }
 
-        protected override void OnScriptFileChanged(object sender, FileSystemEventArgs e)
+        protected override void OnScriptFileChanged(FileSystemEventArgs e)
         {
-            if (_scriptFunc == null)
+            if (_scriptFunc != null)
             {
-                // we're not loaded yet, so nothing to reload
-                return;
+                // clear the node module cache
+                // This is done for any files to ensure that, if a file change triggers
+                // a host restart, we leave the cache clean.
+                ClearRequireCacheFunc(null).GetAwaiter().GetResult();
             }
-
-            // clear the node module cache
-            // This is done for any files to ensure that, if a file change triggers 
-            // a host restart, we leave the cache clean.
-            ClearRequireCacheFunc(null).GetAwaiter().GetResult();
 
             // The ScriptHost is already monitoring for changes to function.json, so we skip those
             string fileName = Path.GetFileName(e.Name);
-            if (string.Compare(fileName, ScriptConstants.FunctionMetadataFileName, StringComparison.OrdinalIgnoreCase) != 0)
+            string fileExtension = Path.GetExtension(fileName);
+            if (string.Compare(fileName, ScriptConstants.FunctionMetadataFileName, StringComparison.OrdinalIgnoreCase) != 0 &&
+                _compilationService.SupportedFileTypes.Contains(fileExtension))
             {
-                // one of the script files for this function changed
-                // force a reload on next execution
-                _scriptFunc = null;
-
-                TraceOnPrimaryHost(string.Format(CultureInfo.InvariantCulture, "Script for function '{0}' changed. Reloading.", Metadata.Name), System.Diagnostics.TraceLevel.Info);
+                _reloadScript();
             }
         }
 
-        private Dictionary<string, object> CreateScriptExecutionContext(object input, DataType dataType, TraceWriter traceWriter, FunctionInvocationContext invocationContext)
+        private async Task ReloadScriptAsync()
+        {
+            // one of the script files for this function changed
+            // force a reload on next execution
+            _functionLoader.Reset();
+            _scriptFunc = null;
+
+            TraceOnPrimaryHost(string.Format(CultureInfo.InvariantCulture, "Script for function '{0}' changed. Reloading.", Metadata.Name), TraceLevel.Info);
+
+            IJavaScriptCompilation compilation = await CompileAndTraceAsync(LogTargets.User, throwOnCompilationError: false);
+
+            if (compilation.SupportsDiagnostics)
+            {
+                bool compilationSucceeded = !compilation.GetDiagnostics().Any(d => d.Severity == DiagnosticSeverity.Error);
+                TraceOnPrimaryHost(string.Format(CultureInfo.InvariantCulture, "Compilation {0}.", compilationSucceeded ? "succeeded" : "failed"), TraceLevel.Info);
+            }
+        }
+
+        private async Task<Dictionary<string, object>> CreateScriptExecutionContextAsync(object input, DataType dataType, TraceWriter traceWriter, FunctionInvocationContext invocationContext)
         {
             // create a TraceWriter wrapper that can be exposed to Node.js
-            var log = (Func<object, Task<object>>)(p =>
+            var log = (ScriptFunc)(p =>
             {
-                string text = p as string;
-                if (text != null)
+                var logData = (IDictionary<string, object>)p;
+                string message = (string)logData["msg"];
+                if (message != null)
                 {
                     try
                     {
-                        traceWriter.Info(text);
+                        TraceLevel level = (TraceLevel)logData["lvl"];
+                        var evt = new TraceEvent(level, message);
+
+                        // Node captures the AsyncLocal value of the first invocation, which means that logs
+                        // are correlated incorrectly. Here we'll overwrite that value with the correct value
+                        // immediately before logging.
+                        using (invocationContext.Logger.BeginScope(
+                            new Dictionary<string, object>
+                            {
+                                ["MS_FunctionInvocationId"] = invocationContext.ExecutionContext.InvocationId
+                            }))
+                        {
+                            // TraceWriter already logs to ILogger
+                            traceWriter.Trace(evt);
+                        }
                     }
                     catch (ObjectDisposedException)
                     {
@@ -290,7 +374,7 @@ namespace Microsoft.Azure.WebJobs.Script.Description
             });
 
             var bindings = new Dictionary<string, object>();
-            var bind = (Func<object, Task<object>>)(p =>
+            var bind = (ScriptFunc)(p =>
             {
                 IDictionary<string, object> bindValues = (IDictionary<string, object>)p;
                 foreach (var bindValue in bindValues)
@@ -300,9 +384,17 @@ namespace Microsoft.Azure.WebJobs.Script.Description
                 return Task.FromResult<object>(null);
             });
 
+            var executionContext = new Dictionary<string, object>
+            {
+                ["invocationId"] = invocationContext.ExecutionContext.InvocationId,
+                ["functionName"] = invocationContext.ExecutionContext.FunctionName,
+                ["functionDirectory"] = invocationContext.ExecutionContext.FunctionDirectory,
+            };
+
             var context = new Dictionary<string, object>()
             {
                 { "invocationId", invocationContext.ExecutionContext.InvocationId },
+                { "executionContext", executionContext },
                 { "log", log },
                 { "bindings", bindings },
                 { "bind", bind }
@@ -313,24 +405,17 @@ namespace Microsoft.Azure.WebJobs.Script.Description
                 context["_entryPoint"] = _entryPoint;
             }
 
-            if (input is HttpRequestMessage)
+            // convert the request to a json object
+            if (input is HttpRequestMessage request)
             {
-                // convert the request to a json object
-                HttpRequestMessage request = (HttpRequestMessage)input;
-                string rawBody = null;
-                var requestObject = CreateRequestObject(request, out rawBody);
+                var requestObject = await CreateRequestObjectAsync(request).ConfigureAwait(false);
                 input = requestObject;
-
-                if (rawBody != null)
-                {
-                    requestObject["rawBody"] = rawBody;
-                }
 
                 // If this is a WebHook function, the input should be the
                 // request body
-                HttpTriggerBindingMetadata httpBinding = _trigger as HttpTriggerBindingMetadata;
-                if (httpBinding != null &&
-                    !string.IsNullOrEmpty(httpBinding.WebHookType))
+                var httpTrigger = _inputBindings.OfType<ExtensionBinding>().SingleOrDefault(p => p.Metadata.IsTrigger)?
+                    .Attributes.OfType<HttpTriggerAttribute>().SingleOrDefault();
+                if (httpTrigger != null && !string.IsNullOrEmpty(httpTrigger.WebHookType))
                 {
                     requestObject.TryGetValue("body", out input);
                 }
@@ -361,6 +446,7 @@ namespace Microsoft.Azure.WebJobs.Script.Description
             }
 
             Utility.ApplyBindingData(input, invocationContext.Binder.BindingData);
+
             var bindingData = NormalizeBindingData(invocationContext.Binder.BindingData);
             bindingData["invocationId"] = invocationContext.ExecutionContext.InvocationId.ToString();
             context["bindingData"] = bindingData;
@@ -379,19 +465,36 @@ namespace Microsoft.Azure.WebJobs.Script.Description
             return context;
         }
 
-        private static Dictionary<string, object> NormalizeBindingData(Dictionary<string, object> bindingData)
+        internal static Dictionary<string, object> NormalizeBindingData(IDictionary<string, object> bindingData)
         {
-            Dictionary<string, object> normalizedBindingData = new Dictionary<string, object>();
+            var normalizedBindingData = new Dictionary<string, object>();
 
             foreach (var pair in bindingData)
             {
-                var name = pair.Key;
                 var value = pair.Value;
-                if (value != null && !IsEdgeSupportedType(value.GetType()))
+                if (value != null)
                 {
-                    // we must convert values to types supported by Edge
-                    // marshalling as needed
-                    value = value.ToString();
+                    var type = value.GetType();
+                    if (value is IDictionary<string, object>)
+                    {
+                        value = NormalizeBindingData((IDictionary<string, object>)value);
+                    }
+                    else if (value is IDictionary<string, object>[])
+                    {
+                        value = ((IEnumerable<IDictionary<string, object>>)value)
+                            .Select(p => NormalizeBindingData(p)).ToArray();
+                    }
+                    else if (value is IDictionary<string, string>)
+                    {
+                        value = ((IDictionary<string, string>)value)
+                            .ToDictionary(p => Utility.ToLowerFirstCharacter(p.Key), p => p.Value);
+                    }
+                    else if (!IsEdgeSupportedType(type) && type.IsClass)
+                    {
+                        // for non primitive POCO types, we convert to
+                        // a normalized dictionary
+                        value = ToDictionary(value);
+                    }
                 }
 
                 // "camel case" the normally Pascal cased properties by
@@ -399,6 +502,7 @@ namespace Microsoft.Azure.WebJobs.Script.Description
                 // While for binding purposes case doesn't matter,
                 // we want to normalize the case to something Node
                 // users would expect to reference in code (e.g. "dequeueCount" not "DequeueCount")
+                var name = pair.Key;
                 name = Utility.ToLowerFirstCharacter(name);
 
                 normalizedBindingData[name] = value;
@@ -407,14 +511,41 @@ namespace Microsoft.Azure.WebJobs.Script.Description
             return normalizedBindingData;
         }
 
+        internal static IDictionary<string, object> ToDictionary(object value)
+        {
+            var properties = PropertyHelper.GetProperties(value);
+            var dictionary = new Dictionary<string, object>();
+            foreach (var property in properties)
+            {
+                if (IsEdgeSupportedType(property.Property.PropertyType))
+                {
+                    dictionary[Utility.ToLowerFirstCharacter(property.Name)] = property.GetValue(value);
+                }
+            }
+            return dictionary;
+        }
+
         internal static bool IsEdgeSupportedType(Type type)
         {
-            if (type == typeof(int) ||
-                type == typeof(double) ||
+            if (type.IsArray)
+            {
+                type = type.GetElementType();
+            }
+
+            if (Utility.IsNullable(type))
+            {
+                type = Nullable.GetUnderlyingType(type);
+            }
+
+            // these are types that we can safely pass directly
+            // to Edge
+            if (type.IsPrimitive ||
+                type.IsEnum ||
                 type == typeof(string) ||
-                type == typeof(bool) ||
-                type == typeof(byte[]) ||
-                type == typeof(object[]))
+                type == typeof(object) ||
+                type == typeof(DateTime) ||
+                type == typeof(DateTimeOffset) ||
+                type == typeof(Uri))
             {
                 return true;
             }
@@ -422,22 +553,21 @@ namespace Microsoft.Azure.WebJobs.Script.Description
             return false;
         }
 
-        private static Dictionary<string, object> CreateRequestObject(HttpRequestMessage request, out string rawBody)
+        private static async Task<Dictionary<string, object>> CreateRequestObjectAsync(HttpRequestMessage request)
         {
-            rawBody = null;
-
             // TODO: need to provide access to remaining request properties
             Dictionary<string, object> requestObject = new Dictionary<string, object>();
             requestObject["originalUrl"] = request.RequestUri.ToString();
             requestObject["method"] = request.Method.ToString().ToUpperInvariant();
-            requestObject["query"] = request.GetQueryNameValuePairs().ToDictionary(kv => kv.Key, kv => kv.Value, StringComparer.OrdinalIgnoreCase);
+            requestObject["query"] = request.GetQueryParameterDictionary();
 
             // since HTTP headers are case insensitive, we lower-case the keys
             // as does Node.js request object
             var headers = request.GetRawHeaders().ToDictionary(p => p.Key.ToLowerInvariant(), p => p.Value);
             requestObject["headers"] = headers;
 
-            // if the request includes a body, add it to the request object 
+            // if the request includes a body, add it to the request object
+            string rawBody = null;
             if (request.Content != null && request.Content.Headers.ContentLength > 0)
             {
                 MediaTypeHeaderValue contentType = request.Content.Headers.ContentType;
@@ -447,7 +577,7 @@ namespace Microsoft.Azure.WebJobs.Script.Description
                 {
                     if (contentType.MediaType == "application/json")
                     {
-                        body = request.Content.ReadAsStringAsync().Result;
+                        body = await request.Content.ReadAsStringAsync().ConfigureAwait(false);
                         if (TryConvertJson((string)body, out jsonObject))
                         {
                             // if the content - type of the request is json, deserialize into an object or array
@@ -457,14 +587,14 @@ namespace Microsoft.Azure.WebJobs.Script.Description
                     }
                     else if (contentType.MediaType == "application/octet-stream")
                     {
-                        body = request.Content.ReadAsByteArrayAsync().Result;
+                        body = await request.Content.ReadAsByteArrayAsync().ConfigureAwait(false);
                     }
                 }
 
                 if (body == null)
                 {
                     // if we don't have a content type, default to reading as string
-                    body = rawBody = request.Content.ReadAsStringAsync().Result;
+                    body = rawBody = await request.Content.ReadAsStringAsync().ConfigureAwait(false);
                 }
 
                 requestObject["body"] = body;
@@ -472,10 +602,15 @@ namespace Microsoft.Azure.WebJobs.Script.Description
 
             // Apply any captured route parameters to the params collection
             object value = null;
-            if (request.Properties.TryGetValue(ScriptConstants.AzureFunctionsHttpRouteDataKey, out value))
+            if (request.Properties.TryGetValue(HttpExtensionConstants.AzureWebJobsHttpRouteDataKey, out value))
             {
                 Dictionary<string, object> routeData = (Dictionary<string, object>)value;
                 requestObject["params"] = routeData;
+            }
+
+            if (rawBody != null)
+            {
+                requestObject["rawBody"] = rawBody;
             }
 
             return requestObject;
@@ -570,9 +705,9 @@ namespace Microsoft.Azure.WebJobs.Script.Description
         /// <summary>
         /// Performs required static initialization in the Edge context.
         /// </summary>
-        private static void Initialize()
+        private static async Task InitializeAsync()
         {
-            var handle = (Func<object, Task<object>>)(err =>
+            var handle = (ScriptFunc)(err =>
             {
                 if (UnhandledException != null)
                 {
@@ -591,7 +726,7 @@ namespace Microsoft.Azure.WebJobs.Script.Description
                 { "handleUncaughtException", handle }
             };
 
-            GlobalInitializationFunc(context).GetAwaiter().GetResult();
+            await GlobalInitializationFunc(context);
         }
     }
 }

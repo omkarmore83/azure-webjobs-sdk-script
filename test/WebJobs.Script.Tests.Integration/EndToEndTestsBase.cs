@@ -18,6 +18,7 @@ using Microsoft.ServiceBus.Messaging;
 using Microsoft.WindowsAzure.MobileServices;
 using Microsoft.WindowsAzure.Storage.Queue;
 using Microsoft.WindowsAzure.Storage.Table;
+using Newtonsoft.Json;
 using Newtonsoft.Json.Linq;
 using Xunit;
 
@@ -40,9 +41,14 @@ namespace Microsoft.Azure.WebJobs.Script.Tests
         {
             TestHelpers.ClearFunctionLogs("TableIn");
 
+            var input = new JObject
+            {
+                { "Region", "West" },
+                { "Status", 1 }
+            };
             var args = new Dictionary<string, object>()
             {
-                { "input", "{ \"Region\": \"West\" }" }
+                { "input", input.ToString() }
             };
             await Fixture.Host.CallAsync("TableIn", args);
 
@@ -69,6 +75,22 @@ namespace Microsoft.Azure.WebJobs.Script.Tests
             Assert.Equal(2, query.Count);
             Assert.Equal("003", (string)query[0]["RowKey"]);
             Assert.Equal("004", (string)query[1]["RowKey"]);
+
+            // verify input validation
+            input = new JObject
+            {
+                { "Region", "West" },
+                { "Status", "1 or Status neq 1" }
+            };
+            args = new Dictionary<string, object>()
+            {
+                { "input", input.ToString() }
+            };
+            var exception = await Assert.ThrowsAsync<FunctionInvocationException>(async () =>
+            {
+                await Fixture.Host.CallAsync("TableIn", args);
+            });
+            Assert.Equal("An invalid parameter value was specified for filter parameter 'Status'.", exception.InnerException.Message);
         }
 
         protected async Task TableOutputTest()
@@ -129,7 +151,45 @@ namespace Microsoft.Azure.WebJobs.Script.Tests
 
             // make sure the input string made it all the way through
             var logs = await TestHelpers.GetFunctionLogsAsync("ManualTrigger");
-            Assert.True(logs.Any(p => p.Contains(testData)));
+            Assert.True(logs.Any(p => p.Contains(testData)), string.Join(Environment.NewLine, logs));
+        }
+
+        public async Task FileLogging_SucceedsTest()
+        {
+            string functionName = "Scenarios";
+            TestHelpers.ClearFunctionLogs(functionName);
+
+            string guid1 = Guid.NewGuid().ToString();
+            string guid2 = Guid.NewGuid().ToString();
+
+            ScenarioInput input = new ScenarioInput
+            {
+                Scenario = "fileLogging",
+                Container = "scenarios-output",
+                Value = $"{guid1};{guid2}"
+            };
+            Dictionary<string, object> arguments = new Dictionary<string, object>
+                {
+                    { "input", JsonConvert.SerializeObject(input) }
+                };
+
+            await Fixture.Host.CallAsync(functionName, arguments);
+
+            // wait for logs to flush
+            await Task.Delay(FileTraceWriter.LogFlushIntervalMs);
+
+            IList<string> logs = null;
+            await TestHelpers.Await(() =>
+            {
+                logs = TestHelpers.GetFunctionLogsAsync(functionName, throwOnNoLogs: false).Result;
+                return logs.Count > 0;
+            });
+
+            Assert.True(logs.Count == 4, string.Join(Environment.NewLine, logs));
+
+            // No need for assert; this will throw if there's not one and only one
+            logs.Single(p => p.EndsWith($"From TraceWriter: {guid1}"));
+            logs.Single(p => p.EndsWith($"From ILogger: {guid2}"));
         }
 
         public async Task QueueTriggerToBlobTest()
@@ -241,9 +301,9 @@ namespace Microsoft.Azure.WebJobs.Script.Tests
 
             try
             {
-                //Only verifying the call succeeds. It is not possible to verify
-                //actual push notificaiton is delivered as they are sent only to 
-                //client applications that registered with NotificationHubs
+                // Only verifying the call succeeds. It is not possible to verify
+                // actual push notificaiton is delivered as they are sent only to
+                // client applications that registered with NotificationHubs
                 await Fixture.Host.CallAsync(functionName, arguments);
             }
             catch (Exception ex)
@@ -252,7 +312,7 @@ namespace Microsoft.Azure.WebJobs.Script.Tests
                 if ((ex.InnerException != null && VerifyNotificationHubExceptionMessage(ex.InnerException)) ||
                     (ex.InnerException != null & ex.InnerException.InnerException != null && VerifyNotificationHubExceptionMessage(ex.InnerException.InnerException)))
                 {
-                    //Expected if using NH without any registrations
+                    // Expected if using NH without any registrations
                 }
                 else
                 {
@@ -268,7 +328,7 @@ namespace Microsoft.Azure.WebJobs.Script.Tests
 
             // The Mobile App needs an anonymous 'Item' table
 
-            // First manually create an item. 
+            // First manually create an item.
             string id = Guid.NewGuid().ToString();
             Dictionary<string, object> arguments = new Dictionary<string, object>
             {
@@ -282,12 +342,6 @@ namespace Microsoft.Azure.WebJobs.Script.Tests
             string messageContent = string.Format("{{ \"recordId\": \"{0}\" }}", id);
             await Fixture.MobileTablesQueue.AddMessageAsync(new CloudQueueMessage(messageContent));
 
-            //TraceEvent traceEvent = await WaitForTraceAsync(p => p.Message.Contains(id) && p.Message.Contains("Updating item"));
-            //Assert.Equal(TraceLevel.Info, traceEvent.Level);
-
-            //string trace = traceEvent.Message;
-            //Assert.True(trace.Contains("Updating item"));
-
             // Only .NET fully supports updating from input bindings. Others will
             // create a new item with -success appended to the id.
             // https://github.com/Azure/azure-webjobs-sdk-script/issues/49
@@ -298,7 +352,7 @@ namespace Microsoft.Azure.WebJobs.Script.Tests
 
         protected async Task ApiHubTest()
         {
-            // ApiHub for dropbox is enabled if the AzureWebJobsDropBox environment variable is set.           
+            // ApiHub for dropbox is enabled if the AzureWebJobsDropBox environment variable is set.
             // The format should be: Endpoint={endpoint};Scheme={scheme};AccessToken={accesstoken}
             // or to use the local file system the format should be: UseLocalFileSystem=true;Path={path}
             string apiHubConnectionString = SettingsManager.GetSetting("AzureWebJobsDropBox");
@@ -330,7 +384,7 @@ namespace Microsoft.Azure.WebJobs.Script.Tests
             };
             await Fixture.Host.CallAsync("ApiHubFileSender", arguments);
 
-            // Second, there's an ApiHubFile trigger which will write a blob. 
+            // Second, there's an ApiHubFile trigger which will write a blob.
             // Once the blob is written, we know both sender & listener are working.
             // TODO: removing the BOM character from result.
             string result = (await TestHelpers.WaitForBlobAndGetStringAsync(resultBlob)).Remove(0, 1);
@@ -419,7 +473,7 @@ namespace Microsoft.Azure.WebJobs.Script.Tests
             if ((exception.Source == "Microsoft.Azure.NotificationHubs")
                 && exception.Message.Contains("notification has no target applications"))
             {
-                //Expected if using NH without any registrations
+                // Expected if using NH without any registrations
                 return true;
             }
             return false;
@@ -457,6 +511,15 @@ namespace Microsoft.Azure.WebJobs.Script.Tests
             logEntry = logEntry.Substring(idx);
 
             return JObject.Parse(logEntry);
+        }
+
+        public class ScenarioInput
+        {
+            public string Scenario { get; set; }
+
+            public string Container { get; set; }
+
+            public string Value { get; set; }
         }
     }
 }

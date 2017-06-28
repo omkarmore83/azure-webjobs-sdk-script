@@ -3,13 +3,14 @@
 
 using System;
 using System.IO;
-using System.Linq;
 using System.Net;
 using System.Net.Http;
 using System.Threading;
 using System.Threading.Tasks;
 using System.Web.Http;
 using System.Web.Http.Controllers;
+using System.Web.Http.Dependencies;
+using Microsoft.Azure.WebJobs.Extensions.Http;
 using Microsoft.Azure.WebJobs.Script.Description;
 using Microsoft.Azure.WebJobs.Script.WebHost.Filters;
 using Microsoft.Azure.WebJobs.Script.WebHost.WebHooks;
@@ -32,35 +33,51 @@ namespace Microsoft.Azure.WebJobs.Script.WebHost.Controllers
 
         public override async Task<HttpResponseMessage> ExecuteAsync(HttpControllerContext controllerContext, CancellationToken cancellationToken)
         {
-            HttpRequestMessage request = controllerContext.Request;
-
-            // First see if the request maps to an HTTP function
-            FunctionDescriptor function = _scriptHostManager.GetHttpFunctionOrNull(request);
+            var request = controllerContext.Request;
+            var function = _scriptHostManager.GetHttpFunctionOrNull(request);
             if (function == null)
             {
+                // request does not map to an HTTP function
                 return new HttpResponseMessage(HttpStatusCode.NotFound);
             }
+            request.SetProperty(ScriptConstants.AzureFunctionsHttpFunctionKey, function);
 
-            // Determine the authorization level of the request
-            ISecretManager secretManager = controllerContext.Configuration.DependencyResolver.GetService<ISecretManager>();
-            AuthorizationLevel authorizationLevel = AuthorizationLevelAttribute.GetAuthorizationLevel(request, secretManager, functionName: function.Name);
-
+            var authorizationLevel = await DetermineAuthorizationLevelAsync(request, function, controllerContext.Configuration.DependencyResolver);
             if (function.Metadata.IsExcluded ||
-                (function.Metadata.IsDisabled && authorizationLevel != AuthorizationLevel.Admin))
+               (function.Metadata.IsDisabled && !(request.IsAuthDisabled() || authorizationLevel == AuthorizationLevel.Admin)))
             {
-                // disabled functions are not publically addressable w/o Admin level auth,
+                // disabled functions are not publicly addressable w/o Admin level auth,
                 // and excluded functions are also ignored here (though the check above will
                 // already exclude them)
                 return new HttpResponseMessage(HttpStatusCode.NotFound);
             }
 
-            // Dispatch the request
-            HttpTriggerBindingMetadata httpFunctionMetadata = (HttpTriggerBindingMetadata)function.Metadata.InputBindings.FirstOrDefault(p => string.Compare("HttpTrigger", p.Type, StringComparison.OrdinalIgnoreCase) == 0);
-            bool isWebHook = !string.IsNullOrEmpty(httpFunctionMetadata.WebHookType);
+            Func<HttpRequestMessage, CancellationToken, Task<HttpResponseMessage>> processRequestHandler = async (req, ct) =>
+            {
+                return await ProcessRequestAsync(req, function, ct);
+            };
+            return await _scriptHostManager.HttpRequestManager.ProcessRequestAsync(request, processRequestHandler, cancellationToken);
+        }
+
+        public static async Task<AuthorizationLevel> DetermineAuthorizationLevelAsync(HttpRequestMessage request, FunctionDescriptor function, IDependencyResolver resolver)
+        {
+            var secretManager = resolver.GetService<ISecretManager>();
+            var authorizationLevel = await AuthorizationLevelAttribute.GetAuthorizationLevelAsync(request, secretManager, functionName: function.Name);
+            request.SetAuthorizationLevel(authorizationLevel);
+
+            return authorizationLevel;
+        }
+
+        private async Task<HttpResponseMessage> ProcessRequestAsync(HttpRequestMessage request, FunctionDescriptor function, CancellationToken cancellationToken)
+        {
+            var httpTrigger = function.GetTriggerAttributeOrNull<HttpTriggerAttribute>();
+            bool isWebHook = !string.IsNullOrEmpty(httpTrigger.WebHookType);
+            var authorizationLevel = request.GetAuthorizationLevel();
             HttpResponseMessage response = null;
+
             if (isWebHook)
             {
-                if (authorizationLevel == AuthorizationLevel.Admin)
+                if (request.HasAuthorizationLevel(AuthorizationLevel.Admin))
                 {
                     // Admin level requests bypass the WebHook auth pipeline
                     response = await _scriptHostManager.HandleRequestAsync(function, request, cancellationToken);
@@ -84,7 +101,7 @@ namespace Microsoft.Azure.WebJobs.Script.WebHost.Controllers
             else
             {
                 // Authorize
-                if (authorizationLevel < httpFunctionMetadata.AuthLevel)
+                if (!request.HasAuthorizationLevel(httpTrigger.AuthLevel))
                 {
                     return new HttpResponseMessage(HttpStatusCode.Unauthorized);
                 }
@@ -92,7 +109,7 @@ namespace Microsoft.Azure.WebJobs.Script.WebHost.Controllers
                 // Not a WebHook request so dispatch directly
                 response = await _scriptHostManager.HandleRequestAsync(function, request, cancellationToken);
             }
-            
+
             return response;
         }
     }

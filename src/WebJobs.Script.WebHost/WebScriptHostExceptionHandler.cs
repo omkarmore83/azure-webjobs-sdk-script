@@ -7,12 +7,14 @@ using System.Threading.Tasks;
 using System.Web.Hosting;
 using Microsoft.Azure.WebJobs.Host;
 using Microsoft.Azure.WebJobs.Host.Timers;
+using Microsoft.Extensions.Logging;
 
 namespace Microsoft.Azure.WebJobs.Script.WebHost
 {
     public class WebScriptHostExceptionHandler : IWebJobsExceptionHandler
     {
         private ScriptHostManager _manager;
+
         public WebScriptHostExceptionHandler(ScriptHostManager manager)
         {
             if (manager == null)
@@ -48,7 +50,9 @@ namespace Microsoft.Azure.WebJobs.Script.WebHost
 
             // We can't wait on this as it may cause a deadlock if the timeout was fired
             // by a Listener that cannot stop until it has completed.
-            Task ignoreTask = _manager.StopAsync();
+#pragma warning disable 4014
+            _manager.StopAsync();
+#pragma warning restore 4014
 
             // Give the manager and all running tasks some time to shut down gracefully.
             await Task.Delay(timeoutGracePeriod);
@@ -67,6 +71,8 @@ namespace Microsoft.Azure.WebJobs.Script.WebHost
         {
             _manager.Instance.TraceWriter.Error(message, exception);
             _manager.Instance.TraceWriter.Flush();
+
+            _manager.Instance.Logger?.LogError(0, exception, message);
         }
     }
 }

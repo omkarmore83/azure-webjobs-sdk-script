@@ -14,10 +14,10 @@ using System.Threading.Tasks;
 using Microsoft.Azure.WebJobs.Host;
 using Microsoft.Azure.WebJobs.Script.Binding;
 using Microsoft.Azure.WebJobs.Script.Description.PowerShell;
+using Microsoft.Extensions.Logging;
 
 namespace Microsoft.Azure.WebJobs.Script.Description
 {
-    [CLSCompliant(false)]
     public class PowerShellFunctionInvoker : ScriptFunctionInvokerBase
     {
         private readonly ScriptHost _host;
@@ -31,8 +31,8 @@ namespace Microsoft.Azure.WebJobs.Script.Description
         private List<string> _moduleFiles;
 
         internal PowerShellFunctionInvoker(ScriptHost host, FunctionMetadata functionMetadata,
-            Collection<FunctionBinding> inputBindings, Collection<FunctionBinding> outputBindings, ITraceWriterFactory traceWriterFactory = null)
-            : base(host, functionMetadata, traceWriterFactory)
+            Collection<FunctionBinding> inputBindings, Collection<FunctionBinding> outputBindings)
+            : base(host, functionMetadata)
         {
             _host = host;
             _scriptFilePath = functionMetadata.ScriptFile;
@@ -55,6 +55,8 @@ namespace Microsoft.Azure.WebJobs.Script.Description
 
             string functionInstanceOutputPath = Path.Combine(Path.GetTempPath(), "Functions", "Binding", invocationId);
             await ProcessInputBindingsAsync(convertedInput, functionInstanceOutputPath, context.Binder, _inputBindings, _outputBindings, bindingData, environmentVariables);
+
+            SetExecutionContextVariables(context.ExecutionContext, environmentVariables);
 
             InitializeEnvironmentVariables(environmentVariables, functionInstanceOutputPath, input, _outputBindings, context.ExecutionContext);
 
@@ -128,7 +130,9 @@ namespace Microsoft.Azure.WebJobs.Script.Description
 
             if (moduleRelativePaths.Any())
             {
-                TraceWriter.Verbose(string.Format("Loaded modules:{0}{1}", Environment.NewLine, string.Join(Environment.NewLine, moduleRelativePaths)));
+                string message = string.Format("Loaded modules:{0}{1}", Environment.NewLine, string.Join(Environment.NewLine, moduleRelativePaths));
+                TraceWriter.Verbose(message);
+                Logger?.LogDebug(message);
             }
         }
 
@@ -265,11 +269,14 @@ namespace Microsoft.Azure.WebJobs.Script.Description
             if (Directory.Exists(moduleDirectory))
             {
                 modulePaths.AddRange(Directory.GetFiles(moduleDirectory,
-                    PowerShellConstants.ModulesManifestFileExtensionPattern));
+                    PowerShellConstants.ModulesManifestFileExtensionPattern,
+                    SearchOption.AllDirectories));
                 modulePaths.AddRange(Directory.GetFiles(moduleDirectory,
-                    PowerShellConstants.ModulesBinaryFileExtensionPattern));
+                    PowerShellConstants.ModulesBinaryFileExtensionPattern,
+                    SearchOption.AllDirectories));
                 modulePaths.AddRange(Directory.GetFiles(moduleDirectory,
-                    PowerShellConstants.ModulesScriptFileExtensionPattern));
+                    PowerShellConstants.ModulesScriptFileExtensionPattern,
+                    SearchOption.AllDirectories));
             }
 
             return modulePaths;
